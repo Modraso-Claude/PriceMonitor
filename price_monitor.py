@@ -75,18 +75,35 @@ def get_price(nm_id: int) -> dict | None:
     p = products[0]
     name = p.get("name", "")
 
-    # Цена в копейках, лежит либо в sizes[0].price, либо в extended-полях —
-    # структура WB периодически меняется, поэтому пробуем несколько путей.
+    # Цена в копейках. Пробуем несколько возможных мест, т.к. структура
+    # WB отличается в зависимости от типа товара и периодически меняется.
     price_kopecks = None
     sizes = p.get("sizes") or []
+
     if sizes:
         price_block = sizes[0].get("price") or {}
         price_kopecks = price_block.get("product") or price_block.get("total")
 
     if price_kopecks is None:
-        print(f"[!] Не удалось извлечь цену для nm_id={nm_id}. "
-              f"Формат ответа WB мог измениться — проверьте вручную.",
-              file=sys.stderr)
+        # Запасной вариант: цена на уровне самого товара, без размеров
+        # (актуально, если sizes пуст — например, товар закончился, но
+        # цена в карточке всё ещё отдаётся)
+        top_price = p.get("priceU") or p.get("salePriceU")
+        if top_price:
+            price_kopecks = top_price
+
+    if price_kopecks is None:
+        # Диагностика: показываем, что реально пришло, чтобы можно было
+        # быстро найти правильное поле вручную
+        sizes_count = len(sizes)
+        in_stock = any((s.get("stocks") for s in sizes)) if sizes else False
+        print(
+            f"[!] Не удалось извлечь цену для nm_id={nm_id} ('{name}'). "
+            f"sizes_count={sizes_count}, есть_остатки={in_stock}. "
+            f"Похоже, товар закончился на складах либо изменился формат "
+            f"ответа WB — проверьте вручную.",
+            file=sys.stderr,
+        )
         return None
 
     return {"price": round(price_kopecks / 100), "name": name}
