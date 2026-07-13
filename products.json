@@ -15,11 +15,6 @@
     "type": "competitor"
   },
   {
-    "nm_id": 338093463,
-    "name": "Pachkoriya Серая",
-    "type": "competitor"
-  },
-  {
     "nm_id": 239615941,
     "name": "Jovenly Песочный",
     "type": "competitor"
@@ -30,8 +25,43 @@
     "type": "competitor"
   },
   {
+    "nm_id": 338093463,
+    "name": "Pachkoriya",
+    "type": "competitor"
+  },
+  {
     "nm_id": 851420273,
-    "name": "Pachkoriya Бежевый",
+    "name": "Pachkoriya",
+    "type": "competitor"
+  },
+  {
+    "nm_id": 851424103,
+    "name": "Pachkoriya",
+    "type": "competitor"
+  },
+  {
+    "nm_id": 851414319,
+    "name": "Pachkoriya",
+    "type": "competitor"
+  },
+  {
+    "nm_id": 399611944,
+    "name": "Pachkoriya",
+    "type": "competitor"
+  },
+  {
+    "nm_id": 223149631,
+    "name": "Everylike",
+    "type": "competitor"
+  },
+  {
+    "nm_id": 851407394,
+    "name": "Pachkoriya",
+    "type": "competitor"
+  },
+  {
+    "nm_id": 279308657,
+    "name": "Everylike",
     "type": "competitor"
   }
   
