@@ -4,11 +4,12 @@
 Логика:
 1. Читаем список товаров из products.json (nm_id — это артикул WB,
    он же число в ссылке товара: wildberries.ru/catalog/<nm_id>/detail.aspx)
-2. Для каждого товара получаем текущую цену через публичный JSON-эндпоинт
-   витрины WB (тот же, что использует сам сайт для отображения цены).
+2. Для каждого товара получаем текущую цену и бренд через публичный
+   JSON-эндпоинт витрины WB (тот же, что использует сам сайт).
 3. Сравниваем с последней сохранённой ценой в history.json.
-4. Если цена изменилась — отправляем уведомление в Telegram и
-   дописываем новую точку в историю.
+4. Раз в запуск отправляем в Telegram ПОЛНЫЙ отчёт по всем товарам —
+   с текущей ценой, брендом и процентом изменения относительно
+   предыдущей проверки (даже если изменений не было).
 
 ВАЖНО: card.wb.ru — не официальный документированный API, а публичный
 эндпоинт витрины. WB может менять его формат без предупреждения.
@@ -39,9 +40,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 def get_price(nm_id: int) -> dict | None:
     """
-    Возвращает цену товара по артикулу через публичный API карточки WB.
-    Возвращает словарь {"price": int, "price_full": int, "name": str}
-    в рублях, либо None, если товар не найден / эндпоинт не ответил.
+    Возвращает данные товара по артикулу через публичный API карточки WB.
+    Возвращает {"price": int, "name": str, "brand": str} в рублях,
+    либо None, если товар не найден / эндпоинт не ответил.
     """
     url = "https://card.wb.ru/cards/v4/detail"
     params = {
@@ -74,6 +75,7 @@ def get_price(nm_id: int) -> dict | None:
 
     p = products[0]
     name = p.get("name", "")
+    brand = p.get("brand", "") or ""
 
     # Цена в копейках. Пробуем несколько возможных мест, т.к. структура
     # WB отличается в зависимости от типа товара и периодически меняется.
@@ -93,8 +95,6 @@ def get_price(nm_id: int) -> dict | None:
             price_kopecks = top_price
 
     if price_kopecks is None:
-        # Диагностика: показываем, что реально пришло, чтобы можно было
-        # быстро найти правильное поле вручную
         sizes_count = len(sizes)
         in_stock = any((s.get("stocks") for s in sizes)) if sizes else False
         print(
@@ -106,7 +106,7 @@ def get_price(nm_id: int) -> dict | None:
         )
         return None
 
-    return {"price": round(price_kopecks / 100), "name": name}
+    return {"price": round(price_kopecks / 100), "name": name, "brand": brand}
 
 
 def load_json(path: Path, default):
@@ -128,11 +128,15 @@ def send_telegram(text: str):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=15,
-        )
+        # Telegram режет длинные сообщения на 4096 символов — при большом
+        # числе товаров разбиваем отчёт на части.
+        chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or [text]
+        for chunk in chunks:
+            requests.post(
+                url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                timeout=15,
+            )
     except Exception as e:
         print(f"[!] Не удалось отправить сообщение в Telegram: {e}", file=sys.stderr)
 
@@ -141,8 +145,10 @@ def main():
     products = load_json(PRODUCTS_FILE, [])
     history = load_json(HISTORY_FILE, {})
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    changes = []
+    now = datetime.now(timezone.utc)
+    timestamp = now.strftime("%Y-%m-%d %H:%M UTC")
+
+    report_lines = []
 
     for product in products:
         nm_id = str(product["nm_id"])
@@ -151,42 +157,45 @@ def main():
 
         result = get_price(product["nm_id"])
         if result is None:
+            report_lines.append(f"⚠️ <b>{label}</b> — не удалось получить цену")
             continue
 
         price = result["price"]
         wb_name = result["name"] or label
+        brand = result["brand"]
 
-        product_history = history.setdefault(nm_id, {"name": wb_name, "type": ptype, "points": []})
+        product_history = history.setdefault(
+            nm_id, {"name": wb_name, "brand": brand, "type": ptype, "points": []}
+        )
+        product_history["brand"] = brand  # обновляем на случай, если раньше не было
         points = product_history["points"]
         last_price = points[-1]["price"] if points else None
 
-        # Записываем точку раз в день (перезаписываем, если уже был запуск сегодня)
-        if points and points[-1]["date"] == today:
-            points[-1]["price"] = price
-        else:
-            points.append({"date": today, "price": price})
+        points.append({"date": timestamp, "price": price})
 
-        if last_price is not None and last_price != price:
+        type_label = "🏠 моё" if ptype == "own" else "🔎 конкурент"
+        brand_part = f" [{brand}]" if brand else ""
+        title = f"<b>{wb_name}</b>{brand_part} ({type_label})"
+
+        if last_price is None:
+            report_lines.append(f"🆕 {title}\n{price} ₽ (первая запись)")
+        elif last_price == price:
+            report_lines.append(f"➖ {title}\n{price} ₽ (без изменений)")
+        else:
             diff = price - last_price
-            arrow = "🔺" if diff > 0 else "🔻"
             pct = (diff / last_price) * 100
-            changes.append(
-                f"{arrow} <b>{wb_name}</b> ({ptype})\n"
-                f"{last_price} ₽ → {price} ₽ ({diff:+d} ₽, {pct:+.1f}%)\n"
-                f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
+            arrow = "🔺" if diff > 0 else "🔻"
+            report_lines.append(
+                f"{arrow} {title}\n"
+                f"{last_price} ₽ → {price} ₽ ({diff:+d} ₽, {pct:+.1f}%)"
             )
             print(f"Изменение цены: {wb_name}: {last_price} -> {price}")
-        else:
-            print(f"{wb_name}: {price} ₽ (без изменений)" if last_price else
-                  f"{wb_name}: {price} ₽ (первая запись)")
 
     save_json(HISTORY_FILE, history)
 
-    if changes:
-        message = "💰 <b>Изменения цен на Wildberries</b>\n\n" + "\n\n".join(changes)
-        send_telegram(message)
-    else:
-        print("Изменений цен не обнаружено.")
+    message = f"💰 <b>Отчёт по ценам Wildberries</b> ({timestamp})\n\n" + "\n\n".join(report_lines)
+    send_telegram(message)
+    print("Отчёт отправлен.")
 
 
 if __name__ == "__main__":
