@@ -4,12 +4,12 @@
 Логика:
 1. Читаем список товаров из products.json (nm_id — это артикул WB,
    он же число в ссылке товара: wildberries.ru/catalog/<nm_id>/detail.aspx)
-2. Для каждого товара получаем текущую цену и бренд через публичный
+2. Для каждого товара получаем текущую цену, бренд и цвет через публичный
    JSON-эндпоинт витрины WB (тот же, что использует сам сайт).
 3. Сравниваем с последней сохранённой ценой в history.json.
 4. Раз в запуск отправляем в Telegram ПОЛНЫЙ отчёт по всем товарам —
-   с текущей ценой, брендом и процентом изменения относительно
-   предыдущей проверки (даже если изменений не было).
+   с текущей ценой, брендом, цветом, артикулом и процентом изменения
+   относительно предыдущей проверки (даже если изменений не было).
 
 ВАЖНО: card.wb.ru — не официальный документированный API, а публичный
 эндпоинт витрины. WB может менять его формат без предупреждения.
@@ -29,9 +29,6 @@ BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
 HISTORY_FILE = BASE_DIR / "history.json"
 
-# Регион для расчёта цены (влияет на скидки/логистику). -1257786 = усреднённый
-# по РФ вариант, которым часто пользуются парсеры. При необходимости
-# замените на код своего региона.
 DEST = "-1257786"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -39,11 +36,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 def get_price(nm_id: int) -> dict | None:
-    """
-    Возвращает данные товара по артикулу через публичный API карточки WB.
-    Возвращает {"price": int, "name": str, "brand": str} в рублях,
-    либо None, если товар не найден / эндпоинт не ответил.
-    """
     url = "https://card.wb.ru/cards/v4/detail"
     params = {
         "appType": 1,
@@ -77,8 +69,9 @@ def get_price(nm_id: int) -> dict | None:
     name = p.get("name", "")
     brand = p.get("brand", "") or ""
 
-    # Цена в копейках. Пробуем несколько возможных мест, т.к. структура
-    # WB отличается в зависимости от типа товара и периодически меняется.
+    colors = p.get("colors") or []
+    color = colors[0].get("name", "") if colors else ""
+
     price_kopecks = None
     sizes = p.get("sizes") or []
 
@@ -87,9 +80,6 @@ def get_price(nm_id: int) -> dict | None:
         price_kopecks = price_block.get("product") or price_block.get("total")
 
     if price_kopecks is None:
-        # Запасной вариант: цена на уровне самого товара, без размеров
-        # (актуально, если sizes пуст — например, товар закончился, но
-        # цена в карточке всё ещё отдаётся)
         top_price = p.get("priceU") or p.get("salePriceU")
         if top_price:
             price_kopecks = top_price
@@ -106,7 +96,7 @@ def get_price(nm_id: int) -> dict | None:
         )
         return None
 
-    return {"price": round(price_kopecks / 100), "name": name, "brand": brand}
+    return {"price": round(price_kopecks / 100), "name": name, "brand": brand, "color": color}
 
 
 def load_json(path: Path, default):
@@ -128,8 +118,6 @@ def send_telegram(text: str):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        # Telegram режет длинные сообщения на 4096 символов — при большом
-        # числе товаров разбиваем отчёт на части.
         chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or [text]
         for chunk in chunks:
             requests.post(
@@ -157,17 +145,19 @@ def main():
 
         result = get_price(product["nm_id"])
         if result is None:
-            report_lines.append(f"⚠️ <b>{label}</b> — не удалось получить цену")
+            report_lines.append(f"⚠️ <b>{label}</b> (артикул {nm_id}) — не удалось получить цену")
             continue
 
         price = result["price"]
         wb_name = result["name"] or label
         brand = result["brand"]
+        color = result["color"]
 
         product_history = history.setdefault(
-            nm_id, {"name": wb_name, "brand": brand, "type": ptype, "points": []}
+            nm_id, {"name": wb_name, "brand": brand, "color": color, "type": ptype, "points": []}
         )
-        product_history["brand"] = brand  # обновляем на случай, если раньше не было
+        product_history["brand"] = brand
+        product_history["color"] = color
         points = product_history["points"]
         last_price = points[-1]["price"] if points else None
 
@@ -175,7 +165,8 @@ def main():
 
         type_label = "🏠 моё" if ptype == "own" else "🔎 конкурент"
         brand_part = f" [{brand}]" if brand else ""
-        title = f"<b>{wb_name}</b>{brand_part} ({type_label})"
+        color_part = f", цвет: {color}" if color else ""
+        title = f"<b>{wb_name}</b>{brand_part} ({type_label}, арт. {nm_id}{color_part})"
 
         if last_price is None:
             report_lines.append(f"🆕 {title}\n{price} ₽ (первая запись)")
