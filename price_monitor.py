@@ -114,19 +114,28 @@ def save_json(path: Path, data):
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы — "
-              "уведомление не отправлено:", text)
+              "уведомление не отправлено:", text, file=sys.stderr)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or [text]
-        for chunk in chunks:
-            requests.post(
+    chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or [text]
+    for chunk in chunks:
+        try:
+            resp = requests.post(
                 url,
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"},
                 timeout=15,
             )
-    except Exception as e:
-        print(f"[!] Не удалось отправить сообщение в Telegram: {e}", file=sys.stderr)
+            data = resp.json()
+            if not data.get("ok"):
+                print(
+                    f"[!] Telegram API вернул ошибку: {data.get('description')} "
+                    f"(код {data.get('error_code')})",
+                    file=sys.stderr,
+                )
+            else:
+                print("Сообщение успешно отправлено в Telegram.")
+        except Exception as e:
+            print(f"[!] Не удалось отправить сообщение в Telegram: {e}", file=sys.stderr)
 
 
 # Артикул вашего товара, с ценой которого сравниваются все остальные
