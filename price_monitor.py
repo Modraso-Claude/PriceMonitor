@@ -75,9 +75,16 @@ def get_price(nm_id: int) -> dict | None:
     price_kopecks = None
     sizes = p.get("sizes") or []
 
-    if sizes:
-        price_block = sizes[0].get("price") or {}
-        price_kopecks = price_block.get("product") or price_block.get("total")
+    for size in sizes:
+        price_block = size.get("price") or {}
+        candidate = (
+            price_block.get("product")
+            or price_block.get("total")
+            or price_block.get("basic")
+        )
+        if candidate:
+            price_kopecks = candidate
+            break
 
     if price_kopecks is None:
         top_price = p.get("priceU") or p.get("salePriceU")
@@ -87,11 +94,11 @@ def get_price(nm_id: int) -> dict | None:
     if price_kopecks is None:
         sizes_count = len(sizes)
         in_stock = any((s.get("stocks") for s in sizes)) if sizes else False
+        raw_sample = json.dumps(sizes[0], ensure_ascii=False)[:300] if sizes else "нет sizes"
         print(
             f"[!] Не удалось извлечь цену для nm_id={nm_id} ('{name}'). "
             f"sizes_count={sizes_count}, есть_остатки={in_stock}. "
-            f"Похоже, товар закончился на складах либо изменился формат "
-            f"ответа WB — проверьте вручную.",
+            f"Пример sizes[0]: {raw_sample}",
             file=sys.stderr,
         )
         return None
@@ -111,18 +118,35 @@ def save_json(path: Path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def send_telegram(text: str):
+def send_telegram_blocks(header: str, blocks: list[str]):
+    """
+    Отправляет заголовок + список блоков (каждый — один товар) в Telegram,
+    группируя их в сообщения не длиннее ~3500 символов. Разрез всегда
+    происходит МЕЖДУ блоками — HTML-теги внутри блока не разрываются.
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы — "
-              "уведомление не отправлено:", text, file=sys.stderr)
+              "уведомление не отправлено.", file=sys.stderr)
         return
+
+    limit = 3500
+    messages = []
+    current = header
+    for block in blocks:
+        candidate = current + "\n\n" + block
+        if len(candidate) > limit and current != header:
+            messages.append(current)
+            current = header + " (продолжение)\n\n" + block
+        else:
+            current = candidate
+    messages.append(current)
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)] or [text]
-    for chunk in chunks:
+    for msg in messages:
         try:
             resp = requests.post(
                 url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "parse_mode": "HTML"},
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
                 timeout=15,
             )
             data = resp.json()
@@ -138,7 +162,6 @@ def send_telegram(text: str):
             print(f"[!] Не удалось отправить сообщение в Telegram: {e}", file=sys.stderr)
 
 
-# Артикул вашего товара, с ценой которого сравниваются все остальные
 REFERENCE_NM_ID = "392074718"
 
 
@@ -235,8 +258,8 @@ def main():
 
     report_lines.extend(error_lines)
 
-    message = f"💰 <b>Отчёт по ценам Wildberries</b> ({timestamp})\n\n" + "\n\n".join(report_lines)
-    send_telegram(message)
+    header = f"💰 <b>Отчёт по ценам Wildberries</b> ({timestamp})"
+    send_telegram_blocks(header, report_lines)
     print("Отчёт отправлен.")
 
 
