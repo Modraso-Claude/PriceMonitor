@@ -20,7 +20,7 @@
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -30,6 +30,9 @@ PRODUCTS_FILE = BASE_DIR / "products.json"
 HISTORY_FILE = BASE_DIR / "history.json"
 
 DEST = "-1257786"
+
+# Россия не переходит на летнее время с 2014 года — фиксированный UTC+3
+MOSCOW_TZ = timezone(timedelta(hours=3))
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -119,11 +122,6 @@ def save_json(path: Path, data):
 
 
 def send_telegram_blocks(header: str, blocks: list[str]):
-    """
-    Отправляет заголовок + список блоков (каждый — один товар) в Telegram,
-    группируя их в сообщения не длиннее ~3500 символов. Разрез всегда
-    происходит МЕЖДУ блоками — HTML-теги внутри блока не разрываются.
-    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы — "
               "уведомление не отправлено.", file=sys.stderr)
@@ -173,8 +171,8 @@ def main():
     products = load_json(PRODUCTS_FILE, [])
     history = load_json(HISTORY_FILE, {})
 
-    now = datetime.now(timezone.utc)
-    timestamp = now.strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(MOSCOW_TZ)
+    timestamp = now.strftime("%d.%m.%Y %H:%M МСК")
 
     items = []
     error_lines = []
