@@ -4,12 +4,12 @@
 Логика:
 1. Читаем список товаров из products.json (nm_id — это артикул WB,
    он же число в ссылке товара: wildberries.ru/catalog/<nm_id>/detail.aspx)
-2. Для каждого товара получаем текущую цену, бренд и цвет через публичный
+2. Для каждого товара получаем текущую цену и бренд через публичный
    JSON-эндпоинт витрины WB (тот же, что использует сам сайт).
 3. Сравниваем с последней сохранённой ценой в history.json.
 4. Раз в запуск отправляем в Telegram ПОЛНЫЙ отчёт по всем товарам —
-   с текущей ценой, брендом, цветом, артикулом и процентом изменения
-   относительно предыдущей проверки (даже если изменений не было).
+   с текущей ценой, брендом и процентом изменения относительно
+   предыдущей проверки (даже если изменений не было).
 
 ВАЖНО: card.wb.ru — не официальный документированный API, а публичный
 эндпоинт витрины. WB может менять его формат без предупреждения.
@@ -129,6 +129,14 @@ def send_telegram(text: str):
         print(f"[!] Не удалось отправить сообщение в Telegram: {e}", file=sys.stderr)
 
 
+# Артикул вашего товара, с ценой которого сравниваются все остальные
+REFERENCE_NM_ID = "392074718"
+
+
+def product_url(nm_id: str) -> str:
+    return f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
+
+
 def main():
     products = load_json(PRODUCTS_FILE, [])
     history = load_json(HISTORY_FILE, {})
@@ -136,7 +144,8 @@ def main():
     now = datetime.now(timezone.utc)
     timestamp = now.strftime("%Y-%m-%d %H:%M UTC")
 
-    report_lines = []
+    items = []
+    error_lines = []
 
     for product in products:
         nm_id = str(product["nm_id"])
@@ -145,7 +154,7 @@ def main():
 
         result = get_price(product["nm_id"])
         if result is None:
-            report_lines.append(f"⚠️ <b>{label}</b> (артикул {nm_id}) — не удалось получить цену")
+            error_lines.append(f"⚠️ <b>{label}</b> (артикул {nm_id}) — не удалось получить цену")
             continue
 
         price = result["price"]
@@ -163,26 +172,59 @@ def main():
 
         points.append({"date": timestamp, "price": price})
 
-        type_label = "🏠 моё" if ptype == "own" else "🔎 конкурент"
-        brand_part = f" [{brand}]" if brand else ""
-        color_part = f", цвет: {color}" if color else ""
-        title = f"<b>{wb_name}</b>{brand_part} ({type_label}, арт. {nm_id}{color_part})"
+        items.append({
+            "nm_id": nm_id,
+            "price": price,
+            "last_price": last_price,
+            "wb_name": wb_name,
+            "brand": brand,
+            "color": color,
+            "ptype": ptype,
+        })
 
-        if last_price is None:
-            report_lines.append(f"🆕 {title}\n{price} ₽ (первая запись)")
-        elif last_price == price:
-            report_lines.append(f"➖ {title}\n{price} ₽ (без изменений)")
-        else:
-            diff = price - last_price
-            pct = (diff / last_price) * 100
-            arrow = "🔺" if diff > 0 else "🔻"
-            report_lines.append(
-                f"{arrow} {title}\n"
-                f"{last_price} ₽ → {price} ₽ ({diff:+d} ₽, {pct:+.1f}%)"
-            )
+        if last_price is not None and last_price != price:
             print(f"Изменение цены: {wb_name}: {last_price} -> {price}")
 
     save_json(HISTORY_FILE, history)
+
+    reference_price = next(
+        (it["price"] for it in items if it["nm_id"] == REFERENCE_NM_ID), None
+    )
+
+    items.sort(key=lambda it: it["price"], reverse=True)
+
+    report_lines = []
+    for it in items:
+        nm_id = it["nm_id"]
+        price = it["price"]
+        last_price = it["last_price"]
+        type_label = "🏠 моё" if it["ptype"] == "own" else "🔎 конкурент"
+        brand_part = f" [{it['brand']}]" if it["brand"] else ""
+        color_part = f", цвет: {it['color']}" if it["color"] else ""
+        link = f'<a href="{product_url(nm_id)}">арт. {nm_id}</a>'
+        title = f"<b>{it['wb_name']}</b>{brand_part} ({type_label}, {link}{color_part})"
+
+        if last_price is None:
+            change_line = f"{price} ₽ (первая запись)"
+            marker = "🆕"
+        elif last_price == price:
+            change_line = f"{price} ₽ (без изменений)"
+            marker = "➖"
+        else:
+            diff = price - last_price
+            pct = (diff / last_price) * 100
+            marker = "🔺" if diff > 0 else "🔻"
+            change_line = f"{last_price} ₽ → {price} ₽ ({diff:+d} ₽, {pct:+.1f}%)"
+
+        vs_reference = ""
+        if reference_price is not None and nm_id != REFERENCE_NM_ID:
+            diff_ref = price - reference_price
+            pct_ref = (diff_ref / reference_price) * 100
+            vs_reference = f"\nvs моя цена: {diff_ref:+d} ₽ ({pct_ref:+.1f}%)"
+
+        report_lines.append(f"{marker} {title}\n{change_line}{vs_reference}")
+
+    report_lines.extend(error_lines)
 
     message = f"💰 <b>Отчёт по ценам Wildberries</b> ({timestamp})\n\n" + "\n\n".join(report_lines)
     send_telegram(message)
