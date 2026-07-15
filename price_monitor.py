@@ -17,8 +17,10 @@
 в README.md.
 """
 
+import calendar
 import json
 import os
+import statistics
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -31,7 +33,6 @@ HISTORY_FILE = BASE_DIR / "history.json"
 
 DEST = "-1257786"
 
-# Россия не переходит на летнее время с 2014 года — фиксированный UTC+3
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -167,6 +168,55 @@ def product_url(nm_id: str) -> str:
     return f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
 
 
+def parse_history_date(date_str: str) -> datetime | None:
+    date_str = (date_str or "").strip()
+    try:
+        return datetime.strptime(date_str, "%d.%m.%Y %H:%M МСК").replace(tzinfo=MOSCOW_TZ)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+        return dt.astimezone(MOSCOW_TZ)
+    except ValueError:
+        return None
+
+
+def send_median_report(history: dict, title: str, start_dt: datetime, end_dt: datetime):
+    rows = []
+    for nm_id, data in history.items():
+        if nm_id == "_meta":
+            continue
+        prices_in_period = [
+            pt["price"] for pt in data.get("points", [])
+            if (dt := parse_history_date(pt.get("date", ""))) and start_dt <= dt <= end_dt
+        ]
+        if not prices_in_period:
+            continue
+        median_price = statistics.median(prices_in_period)
+        name = data.get("name") or nm_id
+        brand = data.get("brand", "")
+        ptype = data.get("type", "own")
+        type_label = "🏠 моё" if ptype == "own" else "🔎 конкурент"
+        brand_part = f" [{brand}]" if brand else ""
+        link = f'<a href="{product_url(nm_id)}">арт. {nm_id}</a>'
+        rows.append({
+            "median": median_price,
+            "text": (
+                f"<b>{name}</b>{brand_part} ({type_label}, {link})\n"
+                f"Медиана: {median_price:.0f} ₽ (по {len(prices_in_period)} набл.: "
+                f"{min(prices_in_period)}–{max(prices_in_period)} ₽)"
+            ),
+        })
+
+    if not rows:
+        return
+
+    rows.sort(key=lambda r: r["median"], reverse=True)
+    blocks = [r["text"] for r in rows]
+    header = f"📊 <b>{title}</b>"
+    send_telegram_blocks(header, blocks)
+
+
 def main():
     products = load_json(PRODUCTS_FILE, [])
     history = load_json(HISTORY_FILE, {})
@@ -215,8 +265,6 @@ def main():
         if last_price is not None and last_price != price:
             print(f"Изменение цены: {wb_name}: {last_price} -> {price}")
 
-    save_json(HISTORY_FILE, history)
-
     reference_price = next(
         (it["price"] for it in items if it["nm_id"] == REFERENCE_NM_ID), None
     )
@@ -259,6 +307,37 @@ def main():
     header = f"💰 <b>Отчёт по ценам Wildberries</b> ({timestamp})"
     send_telegram_blocks(header, report_lines)
     print("Отчёт отправлен.")
+
+    meta = history.setdefault("_meta", {})
+
+    week_id = now.strftime("%Y-W%V")
+    if now.weekday() == 6 and meta.get("last_weekly_report") != week_id:
+        week_start = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        send_median_report(
+            history,
+            f"Медианная цена за неделю ({week_start.strftime('%d.%m')}–{now.strftime('%d.%m.%Y')})",
+            week_start,
+            now,
+        )
+        meta["last_weekly_report"] = week_id
+        print("Недельный отчёт с медианой отправлен.")
+
+    month_id = now.strftime("%Y-%m")
+    last_day_of_month = calendar.monthrange(now.year, now.month)[1]
+    if now.day == last_day_of_month and meta.get("last_monthly_report") != month_id:
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        send_median_report(
+            history,
+            f"Медианная цена за месяц ({month_start.strftime('%m.%Y')})",
+            month_start,
+            now,
+        )
+        meta["last_monthly_report"] = month_id
+        print("Месячный отчёт с медианой отправлен.")
+
+    save_json(HISTORY_FILE, history)
 
 
 if __name__ == "__main__":
