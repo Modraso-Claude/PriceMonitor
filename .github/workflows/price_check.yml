@@ -1,12 +1,10 @@
 name: Мониторинг цен Wildberries
 
 on:
-  schedule:
-    # 07:13 и 19:17 по Москве = 04:13 и 16:17 UTC (некруглые минуты — 
-    # чтобы избежать пиковой нагрузки GitHub Actions в начале каждого часа)
-    - cron: "13 4 * * *"
-    - cron: "17 16 * * *"
-  workflow_dispatch: {}   # позволяет запустить вручную кнопкой в GitHub
+  workflow_dispatch: {}   # запускается вручную кнопкой в GitHub ИЛИ внешним
+                          # планировщиком cron-job.org через GitHub API —
+                          # встроенный schedule: GitHub Actions убран, т.к.
+                          # ненадёжно пропускал запуски на бесплатном тарифе
 
 permissions:
   contents: write
