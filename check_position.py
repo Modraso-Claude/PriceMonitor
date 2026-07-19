@@ -95,7 +95,7 @@ def search_wb_ads(query: str, max_pages: int = 3):
     return all_products
 
 
-
+def search_wb(query: str, max_pages: int = 5):
     """
     Сканирует выдачу постранично. Не останавливается после первой же
     пустой/ошибочной страницы (WB иногда отдаёт временный сбой на
