@@ -1,113 +1,12 @@
 [
   {
     "nm_id": 392074718,
-    "name": "Grunge Lab Черная",
+    "name": "Мой товар (пример)",
     "type": "own"
   },
   {
-    "nm_id": 321863652,
-    "name": "Jovenly Мятный",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 446353933,
-    "name": "NEVM Белый",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 239615941,
-    "name": "Jovenly Песочный",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 360238913,
-    "name": "LIVEIKA Белый",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 338093463,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 851420273,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 851424103,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 851414319,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 399611944,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 223149631,
-    "name": "Everylike",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 851407394,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 279308657,
-    "name": "Everylike",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 998458244,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 223149634,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 768188150,
-    "name": "Grunge Lab",
-    "type": "own"
-  },
-  {
-    "nm_id": 580043666,
-    "name": "Imidj",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 248127079,
-    "name": "FFF SHOP",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 851424103,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 399611944,
-    "name": "Pachkoriya",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 754001378,
-    "name": "LIVEIKA",
-    "type": "competitor"
-  },
-  {
-    "nm_id": 809218241,
-    "name": "imidj",
+    "nm_id": 123456789,
+    "name": "Конкурент 1 (замените на реальный артикул)",
     "type": "competitor"
   }
-  
 ]

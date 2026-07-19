@@ -17,12 +17,14 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import requests
 
 BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
+HISTORY_FILE = BASE_DIR / "history.json"
 
 DEST = "-1257786"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -41,13 +43,20 @@ def load_json(path: Path, default):
     return default
 
 
-def search_wb(query: str, max_pages: int = 10):
-    """Сканирует выдачу постранично, возвращает товары в порядке позиций."""
+def search_wb(query: str, max_pages: int = 5):
+    """
+    Сканирует выдачу постранично. Не останавливается после первой же
+    пустой/ошибочной страницы (WB иногда отдаёт временный сбой на
+    отдельной странице) — сдаётся только после двух неудач подряд.
+    """
     all_products = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Referer": "https://www.wildberries.ru/",
+        "Accept": "application/json",
     }
+    consecutive_failures = 0
     for page in range(1, max_pages + 1):
         url = "https://search.wb.ru/exactmatch/ru/common/v18/search"
         params = {
@@ -59,13 +68,22 @@ def search_wb(query: str, max_pages: int = 10):
             resp = requests.get(url, params=params, headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
+            products = data.get("products") or (data.get("data") or {}).get("products") or []
         except Exception as e:
             print(f"[!] Ошибка поиска '{query}', страница {page}: {e}", file=sys.stderr)
-            break
-        products = data.get("products") or (data.get("data") or {}).get("products") or []
+            products = []
+
         if not products:
-            break
+            consecutive_failures += 1
+            print(f"[i] Страница {page} пустая (подряд неудач: {consecutive_failures})", file=sys.stderr)
+            if consecutive_failures >= 2:
+                break
+            time.sleep(0.7)
+            continue
+
+        consecutive_failures = 0
         all_products.extend(products)
+        time.sleep(0.3)
     return all_products
 
 
@@ -105,7 +123,17 @@ def main():
         print("[!] SEARCH_QUERY не задан — нечего проверять", file=sys.stderr)
         return
 
-    tracked_products = load_json(PRODUCTS_FILE, [])
+    tracked_products_raw = load_json(PRODUCTS_FILE, [])
+    seen_ids = set()
+    tracked_products = []
+    for p in tracked_products_raw:
+        nid = str(p.get("nm_id"))
+        if nid in seen_ids:
+            continue
+        seen_ids.add(nid)
+        tracked_products.append(p)
+
+    history = load_json(HISTORY_FILE, {})
     results = search_wb(QUERY)
 
     position_by_id = {}
@@ -124,20 +152,30 @@ def main():
         item = info_by_id.get(nm_id)
 
         if item:
-            brand = item.get("brand", "") or "—"
+            # Товар нашёлся в этой выдаче — берём свежие данные прямо из неё
+            brand = item.get("brand", "") or label
             colors = item.get("colors") or []
-            color = colors[0].get("name", "") if colors else "—"
+            color = colors[0].get("name", "") if colors else "н/д"
             price_kopecks = None
             for size in item.get("sizes") or []:
                 pb = size.get("price") or {}
                 price_kopecks = pb.get("product") or pb.get("total") or pb.get("basic")
                 if price_kopecks:
                     break
-            price_str = f"{round(price_kopecks / 100)} ₽" if price_kopecks else "—"
+            price_str = f"{round(price_kopecks / 100)} ₽" if price_kopecks else "н/д"
         else:
-            brand = label
-            color = "—"
-            price_str = "—"
+            # Товар не найден в просканированной части выдачи — этот конкретный
+            # запрос ничего о нём не знает. Подставляем последние известные
+            # данные из history.json (их накапливает price_monitor.py дважды
+            # в день), а не пустое "н/д".
+            hist_entry = history.get(nm_id, {})
+            brand = hist_entry.get("brand") or label
+            color = hist_entry.get("color") or "н/д"
+            hist_points = hist_entry.get("points") or []
+            if hist_points:
+                price_str = f"{hist_points[-1]['price']} ₽ (посл. известная)"
+            else:
+                price_str = "н/д"
 
         type_label = "🏠" if ptype == "own" else "🔎"
         link = f'<a href="{product_url(nm_id)}">арт. {nm_id}</a>'
