@@ -1,0 +1,38 @@
+name: Проверка позиций в поиске WB
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Поисковый запрос"
+        required: true
+        type: choice
+        options:
+          - "футболка варенка мужская"
+          - "футболка мужская"
+          - "футболка мужская оверсайз"
+
+permissions:
+  contents: read
+
+jobs:
+  check-position:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Check search position
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEARCH_QUERY: ${{ inputs.query }}
+        run: python check_position.py
