@@ -43,67 +43,6 @@ def load_json(path: Path, default):
     return default
 
 
-def search_wb_ads(query: str, limit: int = 100):
-    """
-    Проверяет рекламную "полку" (banners/shelfs) — карточки, которые
-    вклиниваются в поисковую выдачу как реклама. Адрес найден вручную
-    через DevTools в браузере (Network → Fetch/XHR при поиске на
-    wildberries.ru), а не подобран по аналогии — поэтому более надёжен,
-    чем прошлая версия. Тем не менее структура ответа не документирована
-    официально, так что при неожиданном формате в лог печатается сырой
-    фрагмент ответа для диагностики.
-
-    "Место" в этом отчёте — порядковый номер в ответе рекламной полки,
-    что близко к порядку показа, но НЕ гарантированно совпадает 1-в-1 с
-    номером визуального слота на странице (WB может домешивать рекламу
-    в органику по дополнительным правилам, не видимым через этот запрос).
-    """
-    url = "https://www.wildberries.ru/__internal/banners/shelfs/search"
-    params = {
-        "urltype": "null",
-        "apptype": 1,
-        "displaytype": 3,
-        "longitude": 37.6201,
-        "latitude": 55.753737,
-        "country": 1,
-        "culture": "ru",
-        "dest": DEST,
-        "ab_testing": "false",
-        "scale": 4,
-        "query": query,
-        "minquantity": 13,
-        "limit": limit,
-        "curr": "rub",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Referer": "https://www.wildberries.ru/",
-        "Accept": "application/json",
-    }
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"[!] Ошибка проверки рекламы '{query}': {e}", file=sys.stderr)
-        return []
-
-    products = (
-        data.get("products") or data.get("items") or data.get("cards")
-        or data.get("banners")
-        or (data.get("data") or {}).get("products")
-        or (data.get("data") or {}).get("items")
-        or []
-    )
-    if not products:
-        raw_sample = json.dumps(data, ensure_ascii=False)[:800]
-        print(f"[i] banners/shelfs: пустой/непонятный результат. Сырой ответ: {raw_sample}", file=sys.stderr)
-    return products
-
-
-
-
 def search_wb(query: str, max_pages: int = 5):
     """
     Сканирует выдачу постранично. Не останавливается после первой же
@@ -130,6 +69,13 @@ def search_wb(query: str, max_pages: int = 5):
             resp.raise_for_status()
             data = resp.json()
             products = data.get("products") or (data.get("data") or {}).get("products") or []
+        except requests.exceptions.HTTPError as e:
+            is_rate_limited = e.response is not None and e.response.status_code == 429
+            print(f"[!] Ошибка поиска '{query}', страница {page}: {e}", file=sys.stderr)
+            if is_rate_limited:
+                print("[i] Похоже на ограничение частоты запросов — пауза подольше перед следующей попыткой", file=sys.stderr)
+                time.sleep(2.5)
+            products = []
         except Exception as e:
             print(f"[!] Ошибка поиска '{query}', страница {page}: {e}", file=sys.stderr)
             products = []
@@ -196,7 +142,6 @@ def main():
 
     history = load_json(HISTORY_FILE, {})
     results = search_wb(QUERY)
-    ad_results = search_wb_ads(QUERY)
 
     position_by_id = {}
     info_by_id = {}
@@ -204,11 +149,6 @@ def main():
         pid = str(p.get("id"))
         position_by_id.setdefault(pid, idx + 1)
         info_by_id[pid] = p
-
-    ad_position_by_id = {}
-    for idx, p in enumerate(ad_results):
-        pid = str(p.get("id") or p.get("nmId") or p.get("nm"))
-        ad_position_by_id.setdefault(pid, idx + 1)
 
     rows = []
     for product in tracked_products:
@@ -248,17 +188,13 @@ def main():
         link = f'<a href="{product_url(nm_id)}">арт. {nm_id}</a>'
         place_str = f"<b>{pos}</b>" if pos else f"<b>вне топ-{len(results)}</b>"
 
-        ad_pos = ad_position_by_id.get(nm_id)
-        ad_str = f" | 🎯 Реклама: место {ad_pos} из {len(ad_results)}" if ad_pos else ""
-
         rows.append({
             "pos": pos if pos is not None else float("inf"),
-            "text": f"{type_label} {brand} — {color} — {link} — {price_str} — Место: {place_str}{ad_str}",
+            "text": f"{type_label} {brand} — {color} — {link} — {price_str} — Место: {place_str}",
         })
 
     rows.sort(key=lambda r: r["pos"])
-    ads_note = f", реклама: {len(ad_results)} объявлений" if ad_results else ""
-    header = f"📍 <b>Позиции по запросу</b> «{QUERY}» (просмотрено {len(results)} товаров в выдаче{ads_note})"
+    header = f"📍 <b>Позиции по запросу</b> «{QUERY}» (просмотрено {len(results)} товаров в выдаче)"
     send_telegram_blocks(header, [r["text"] for r in rows])
 
 
