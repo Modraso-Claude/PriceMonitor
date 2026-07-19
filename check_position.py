@@ -43,56 +43,65 @@ def load_json(path: Path, default):
     return default
 
 
-def search_wb_ads(query: str, max_pages: int = 3):
+def search_wb_ads(query: str, limit: int = 100):
     """
-    Проверяет РЕКЛАМНУЮ выдачу (не органическую) через отдельный эндпоинт
-    catalog-ads.wildberries.ru. Это ЭКСПЕРИМЕНТАЛЬНАЯ функция: эндпоинт
-    недокументирован официально, точный набор параметров подобран по
-    аналогии с обычным поиском — если WB отдаёт неожиданный формат,
-    в лог печатается сырой фрагмент ответа для диагностики.
+    Проверяет рекламную "полку" (banners/shelfs) — карточки, которые
+    вклиниваются в поисковую выдачу как реклама. Адрес найден вручную
+    через DevTools в браузере (Network → Fetch/XHR при поиске на
+    wildberries.ru), а не подобран по аналогии — поэтому более надёжен,
+    чем прошлая версия. Тем не менее структура ответа не документирована
+    официально, так что при неожиданном формате в лог печатается сырой
+    фрагмент ответа для диагностики.
 
-    Позиция здесь — это порядковый номер среди всех показанных объявлений
-    по запросу (грубая оценка "насколько активно рекламируется"), а НЕ
-    точный номер слота на странице (1-й, 2-й, 10-й... как на сайте) —
-    WB подмешивает рекламу в органику по отдельному, более сложному
-    алгоритму, который через этот эндпоинт напрямую не виден.
+    "Место" в этом отчёте — порядковый номер в ответе рекламной полки,
+    что близко к порядку показа, но НЕ гарантированно совпадает 1-в-1 с
+    номером визуального слота на странице (WB может домешивать рекламу
+    в органику по дополнительным правилам, не видимым через этот запрос).
     """
-    all_products = []
+    url = "https://www.wildberries.ru/__internal/banners/shelfs/search"
+    params = {
+        "urltype": "null",
+        "apptype": 1,
+        "displaytype": 3,
+        "longitude": 37.6201,
+        "latitude": 55.753737,
+        "country": 1,
+        "culture": "ru",
+        "dest": DEST,
+        "ab_testing": "false",
+        "scale": 4,
+        "query": query,
+        "minquantity": 13,
+        "limit": limit,
+        "curr": "rub",
+    }
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Referer": "https://www.wildberries.ru/",
         "Accept": "application/json",
     }
-    for page in range(1, max_pages + 1):
-        url = "https://catalog-ads.wildberries.ru/api/v5/search"
-        params = {
-            "keyword": query, "dest": DEST, "curr": "rub",
-            "spp": 30, "page": page, "appType": 1, "lang": "ru",
-        }
-        try:
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            print(f"[!] Ошибка проверки рекламы '{query}', страница {page}: {e}", file=sys.stderr)
-            break
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[!] Ошибка проверки рекламы '{query}': {e}", file=sys.stderr)
+        return []
 
-        products = (
-            data.get("products") or data.get("items") or data.get("adverts")
-            or (data.get("data") or {}).get("products")
-            or (data.get("data") or {}).get("items")
-            or []
-        )
-        if not products:
-            if page == 1:
-                # Диагностика на случай, если формат ответа отличается от ожидаемого
-                raw_sample = json.dumps(data, ensure_ascii=False)[:500]
-                print(f"[i] catalog-ads: пустой результат на 1-й странице. Сырой ответ: {raw_sample}", file=sys.stderr)
-            break
-        all_products.extend(products)
-        time.sleep(0.3)
-    return all_products
+    products = (
+        data.get("products") or data.get("items") or data.get("cards")
+        or data.get("banners")
+        or (data.get("data") or {}).get("products")
+        or (data.get("data") or {}).get("items")
+        or []
+    )
+    if not products:
+        raw_sample = json.dumps(data, ensure_ascii=False)[:800]
+        print(f"[i] banners/shelfs: пустой/непонятный результат. Сырой ответ: {raw_sample}", file=sys.stderr)
+    return products
+
+
 
 
 def search_wb(query: str, max_pages: int = 5):
