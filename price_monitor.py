@@ -44,8 +44,29 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
-def get_price(nm_id: int) -> dict | None:
+
+def make_warmed_up_session() -> requests.Session:
+    """
+    __internal API-пути WB, судя по всему, проверяют, что запрос похож
+    на настоящую браузерную сессию (cookies + характерные заголовки), а
+    не голый HTTP-запрос — поэтому сперва "заходим" на сайт как обычный
+    посетитель, чтобы получить cookies, и переиспользуем их дальше.
+    """
+    session = requests.Session()
+    session.headers.update({"User-Agent": BROWSER_USER_AGENT})
+    try:
+        session.get("https://www.wildberries.ru/", timeout=15)
+    except Exception as e:
+        print(f"[!] Не удалось прогреть сессию (продолжаем всё равно): {e}", file=sys.stderr)
+    return session
+
+
+def get_price(session: requests.Session, nm_id: int) -> dict | None:
     url = "https://www.wildberries.ru/__internal/u-card/cards/v4/detail"
     params = {
         "appType": 1,
@@ -60,14 +81,17 @@ def get_price(nm_id: int) -> dict | None:
         "nm": nm_id,
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Referer": "https://www.wildberries.ru/",
         "Accept": "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9",
+        "Origin": "https://www.wildberries.ru",
+        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     }
 
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp = session.get(url, params=params, headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
@@ -234,6 +258,8 @@ def main():
     now = datetime.now(MOSCOW_TZ)
     timestamp = now.strftime("%d.%m.%Y %H:%M МСК")
 
+    session = make_warmed_up_session()
+
     items = []
     error_lines = []
 
@@ -242,7 +268,7 @@ def main():
         label = product.get("name") or nm_id
         ptype = product.get("type", "own")
 
-        result = get_price(product["nm_id"])
+        result = get_price(session, product["nm_id"])
         if result is None:
             error_lines.append(f"⚠️ <b>{label}</b> (артикул {nm_id}) — не удалось получить цену")
             continue
