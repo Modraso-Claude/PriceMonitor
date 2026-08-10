@@ -4,17 +4,22 @@
 Логика:
 1. Читаем список товаров из products.json (nm_id — это артикул WB,
    он же число в ссылке товара: wildberries.ru/catalog/<nm_id>/detail.aspx)
-2. Для каждого товара получаем текущую цену и бренд через публичный
-   JSON-эндпоинт витрины WB (тот же, что использует сам сайт).
+2. Для каждого товара получаем текущую цену, бренд и цвет через
+   внутренний прокси-путь основного домена WB (www.wildberries.ru/__internal/...).
 3. Сравниваем с последней сохранённой ценой в history.json.
 4. Раз в запуск отправляем в Telegram ПОЛНЫЙ отчёт по всем товарам —
-   с текущей ценой, брендом и процентом изменения относительно
+   с текущей ценой, брендом, цветом и процентом изменения относительно
    предыдущей проверки (даже если изменений не было).
 
-ВАЖНО: card.wb.ru — не официальный документированный API, а публичный
-эндпоинт витрины. WB может менять его формат без предупреждения.
-Если скрипт перестанет находить цену — см. раздел "Если сломалось"
-в README.md.
+ВАЖНО про адрес запроса: раньше здесь использовался отдельный поддомен
+card.wb.ru, но он (как и search.wb.ru) стал недоступен из GitHub Actions —
+запросы зависают на ConnectTimeout, похоже на блокировку по диапазону IP
+дата-центров. Переключились на www.wildberries.ru/__internal/u-card/... —
+это путь на основном домене сайта, найденный вручную через DevTools в
+браузере, его нельзя заблокировать, не сломав сайт для обычных посетителей.
+Если он тоже перестанет отвечать — искать новый путь тем же способом
+(DevTools → Network → Fetch/XHR → открыть страницу товара → найти запрос
+с "detail" в названии → Headers → Request URL).
 """
 
 import calendar
@@ -31,9 +36,6 @@ BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
 HISTORY_FILE = BASE_DIR / "history.json"
 
-# Регион для расчёта цены (влияет на скидки/логистику). -1257786 = усреднённый
-# по РФ вариант, которым часто пользуются парсеры. При необходимости
-# замените на код своего региона.
 DEST = "-1257786"
 
 # Россия не переходит на летнее время с 2014 года — фиксированный UTC+3
@@ -44,25 +46,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 def get_price(nm_id: int) -> dict | None:
-    """
-    Возвращает данные товара по артикулу через публичный API карточки WB.
-    Возвращает {"price": int, "name": str, "brand": str} в рублях,
-    либо None, если товар не найден / эндпоинт не ответил.
-    """
-    url = "https://card.wb.ru/cards/v4/detail"
+    url = "https://www.wildberries.ru/__internal/u-card/cards/v4/detail"
     params = {
         "appType": 1,
         "curr": "rub",
         "dest": DEST,
         "spp": 30,
-        "hide_dtype": 13,
-        "ab_testing": "false",
+        "hide_vflags": 4294967296,
+        "hide_dtype": 15,
+        "mtype": 257,
         "lang": "ru",
+        "ab_testing": "false",
         "nm": nm_id,
     }
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Referer": "https://www.wildberries.ru/",
+        "Accept": "application/json",
     }
 
     try:
@@ -82,19 +83,12 @@ def get_price(nm_id: int) -> dict | None:
     name = p.get("name", "")
     brand = p.get("brand", "") or ""
 
-    # Цвет: обычно лежит в списке colors как [{"name": "белый", ...}] —
-    # каждый артикул (nm_id) на WB соответствует одному конкретному цвету.
     colors = p.get("colors") or []
     color = colors[0].get("name", "") if colors else ""
 
-    # Цена в копейках. Пробуем несколько возможных мест, т.к. структура
-    # WB отличается в зависимости от типа товара и периодически меняется.
     price_kopecks = None
     sizes = p.get("sizes") or []
 
-    # Перебираем ВСЕ размеры (не только первый) — иногда у первого размера
-    # в ответе нет цены (например, распродан именно этот размер), а у
-    # остальных есть.
     for size in sizes:
         price_block = size.get("price") or {}
         candidate = (
@@ -107,9 +101,6 @@ def get_price(nm_id: int) -> dict | None:
             break
 
     if price_kopecks is None:
-        # Запасной вариант: цена на уровне самого товара, без размеров
-        # (актуально, если sizes пуст — например, товар закончился, но
-        # цена в карточке всё ещё отдаётся)
         top_price = p.get("priceU") or p.get("salePriceU")
         if top_price:
             price_kopecks = top_price
@@ -117,8 +108,6 @@ def get_price(nm_id: int) -> dict | None:
     if price_kopecks is None:
         sizes_count = len(sizes)
         in_stock = any((s.get("stocks") for s in sizes)) if sizes else False
-        # Печатаем сырой фрагмент первого размера — поможет быстро найти
-        # правильное поле, если и этот запасной вариант не сработает
         raw_sample = json.dumps(sizes[0], ensure_ascii=False)[:300] if sizes else "нет sizes"
         print(
             f"[!] Не удалось извлечь цену для nm_id={nm_id} ('{name}'). "
@@ -144,13 +133,6 @@ def save_json(path: Path, data):
 
 
 def send_telegram_blocks(header: str, blocks: list[str]):
-    """
-    Отправляет заголовок + список блоков (каждый — один товар) в Telegram,
-    группируя их в сообщения не длиннее ~3500 символов. В отличие от
-    разрезания сплошного текста по количеству символов, здесь разрез всегда
-    происходит МЕЖДУ блоками — поэтому HTML-теги внутри блока никогда не
-    разрываются пополам.
-    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы — "
               "уведомление не отправлено.", file=sys.stderr)
@@ -189,7 +171,6 @@ def send_telegram_blocks(header: str, blocks: list[str]):
             print(f"[!] Не удалось отправить сообщение в Telegram: {e}", file=sys.stderr)
 
 
-# Артикул вашего товара, с ценой которого сравниваются все остальные
 REFERENCE_NM_ID = "392074718"
 
 
@@ -198,8 +179,6 @@ def product_url(nm_id: str) -> str:
 
 
 def parse_history_date(date_str: str) -> datetime | None:
-    """Разбирает дату из history.json — поддерживает и новый формат
-    (дд.мм.гггг МСК), и старый (гггг-мм-дд UTC) для старых записей."""
     date_str = (date_str or "").strip()
     try:
         return datetime.strptime(date_str, "%d.%m.%Y %H:%M МСК").replace(tzinfo=MOSCOW_TZ)
@@ -213,8 +192,6 @@ def parse_history_date(date_str: str) -> datetime | None:
 
 
 def send_median_report(history: dict, title: str, start_dt: datetime, end_dt: datetime):
-    """Считает медианную цену по каждому товару за период [start_dt, end_dt]
-    и отправляет отдельным сообщением в Telegram."""
     rows = []
     for nm_id, data in history.items():
         if nm_id == "_meta":
@@ -257,8 +234,8 @@ def main():
     now = datetime.now(MOSCOW_TZ)
     timestamp = now.strftime("%d.%m.%Y %H:%M МСК")
 
-    items = []       # успешно получили цену — сортируем и показываем сверху
-    error_lines = []  # не удалось получить цену — показываем внизу отдельно
+    items = []
+    error_lines = []
 
     for product in products:
         nm_id = str(product["nm_id"])
@@ -278,7 +255,7 @@ def main():
         product_history = history.setdefault(
             nm_id, {"name": wb_name, "brand": brand, "color": color, "type": ptype, "points": []}
         )
-        product_history["brand"] = brand  # обновляем на случай, если раньше не было
+        product_history["brand"] = brand
         product_history["color"] = color
         points = product_history["points"]
         last_price = points[-1]["price"] if points else None
@@ -298,15 +275,10 @@ def main():
         if last_price is not None and last_price != price:
             print(f"Изменение цены: {wb_name}: {last_price} -> {price}")
 
-    # save_json(HISTORY_FILE, history) — перенесено в конец функции,
-    # чтобы заодно сохранить отметки об отправленных периодических отчётах
-
-    # Цена вашего товара — точка отсчёта для сравнения с конкурентами
     reference_price = next(
         (it["price"] for it in items if it["nm_id"] == REFERENCE_NM_ID), None
     )
 
-    # Сортировка по убыванию цены — самый дорогой товар сверху
     items.sort(key=lambda it: it["price"], reverse=True)
 
     report_lines = []
@@ -320,7 +292,6 @@ def main():
         link = f'<a href="{product_url(nm_id)}">арт. {nm_id}</a>'
         title = f"<b>{it['wb_name']}</b>{brand_part} ({type_label}, {link}{color_part})"
 
-        # Изменение цены с прошлой проверки
         if last_price is None:
             change_line = f"{price} ₽ (первая запись)"
             marker = "🆕"
@@ -333,7 +304,6 @@ def main():
             marker = "🔺" if diff > 0 else "🔻"
             change_line = f"{last_price} ₽ → {price} ₽ ({diff:+d} ₽, {pct:+.1f}%)"
 
-        # Разница с ценой вашего товара (392074718)
         vs_reference = ""
         if reference_price is not None and nm_id != REFERENCE_NM_ID:
             diff_ref = price - reference_price
@@ -348,7 +318,6 @@ def main():
     send_telegram_blocks(header, report_lines)
     print("Отчёт отправлен.")
 
-    # --- Периодические отчёты: медиана за неделю (по вс) и за месяц (в последний день) ---
     meta = history.setdefault("_meta", {})
 
     week_id = now.strftime("%Y-W%V")
