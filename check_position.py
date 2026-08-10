@@ -2,12 +2,15 @@
 Проверяет позиции отслеживаемых товаров в поисковой выдаче Wildberries
 по ОДНОМУ поисковому запросу и отправляет результат в Telegram.
 
-В отличие от price_monitor.py — запускается НЕ по расписанию, а по
-требованию: бот на PythonAnywhere дёргает GitHub Actions через API
-(workflow_dispatch) при нажатии кнопки в Telegram, передавая нужный
-запрос как input. Сам поиск идёт отсюда, потому что у GitHub Actions
-неограниченный интернет — search.wb.ru заблокирован на бесплатном
-тарифе PythonAnywhere, а здесь такой проблемы нет.
+Запускается НЕ по расписанию, а по требованию: бот на PythonAnywhere
+дёргает GitHub Actions через API (workflow_dispatch) при нажатии кнопки
+в Telegram, передавая нужный запрос как input.
+
+ВАЖНО про адрес запроса: раньше здесь использовался отдельный поддомен
+search.wb.ru, но он стал недоступен из GitHub Actions (та же история,
+что и с card.wb.ru в price_monitor.py — запросы зависают на
+ConnectTimeout). Переключились на www.wildberries.ru/__internal/u-search/...
+— путь на основном домене сайта, найденный вручную через DevTools.
 
 Переменные окружения:
   SEARCH_QUERY        — какой запрос проверять (передаётся из workflow input)
@@ -58,11 +61,13 @@ def search_wb(query: str, max_pages: int = 5):
     }
     consecutive_failures = 0
     for page in range(1, max_pages + 1):
-        url = "https://search.wb.ru/exactmatch/ru/common/v18/search"
+        url = "https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search"
         params = {
             "appType": 1, "curr": "rub", "dest": DEST, "lang": "ru",
-            "page": page, "query": query, "resultset": "catalog",
-            "sort": "popular", "spp": 30,
+            "locale": "ru", "page": page, "query": query, "resultset": "catalog",
+            "sort": "popular", "spp": 30, "hide_dtype": 15,
+            "hide_vflags": 4294967296, "inheritFilters": "true",
+            "suppressSpellcheck": "false", "ab_testing": "false",
         }
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=15)
