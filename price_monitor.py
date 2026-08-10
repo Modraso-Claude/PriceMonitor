@@ -31,6 +31,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
+from curl_cffi import requests as cf_requests
 
 BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
@@ -44,21 +45,17 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BROWSER_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
 
-
-def make_warmed_up_session() -> requests.Session:
+def make_warmed_up_session() -> cf_requests.Session:
     """
-    __internal API-пути WB, судя по всему, проверяют, что запрос похож
-    на настоящую браузерную сессию (cookies + характерные заголовки), а
-    не голый HTTP-запрос — поэтому сперва "заходим" на сайт как обычный
-    посетитель, чтобы получить cookies, и переиспользуем их дальше.
+    Обычная библиотека requests легко отличима от настоящего браузера по
+    TLS-отпечатку (ClientHello) ещё до того, как сервер увидит какие-либо
+    заголовки — именно поэтому даже с правильными cookies/заголовками
+    запросы получали 403. curl_cffi умеет имитировать точный TLS-отпечаток
+    настоящего Chrome, оставаясь обычным HTTP-клиентом (без запуска
+    реального браузера, в отличие от Playwright/Selenium).
     """
-    session = requests.Session()
-    session.headers.update({"User-Agent": BROWSER_USER_AGENT})
+    session = cf_requests.Session(impersonate="chrome124")
     try:
         session.get("https://www.wildberries.ru/", timeout=15)
     except Exception as e:
@@ -66,7 +63,7 @@ def make_warmed_up_session() -> requests.Session:
     return session
 
 
-def get_price(session: requests.Session, nm_id: int) -> dict | None:
+def get_price(session: cf_requests.Session, nm_id: int) -> dict | None:
     url = "https://www.wildberries.ru/__internal/u-card/cards/v4/detail"
     params = {
         "appType": 1,
