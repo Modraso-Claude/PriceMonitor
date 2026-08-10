@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import requests
+from curl_cffi import requests as cf_requests
 
 BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
@@ -46,19 +47,25 @@ def load_json(path: Path, default):
     return default
 
 
-def search_wb(query: str, max_pages: int = 5):
+
+def make_warmed_up_session() -> cf_requests.Session:
+    """См. price_monitor.py — обычная requests легко отличима от Chrome
+    по TLS-отпечатку, поэтому используем curl_cffi для его имитации."""
+    session = cf_requests.Session(impersonate="chrome124")
+    try:
+        session.get("https://www.wildberries.ru/", timeout=15)
+    except Exception as e:
+        print(f"[!] Не удалось прогреть сессию (продолжаем всё равно): {e}", file=sys.stderr)
+    return session
+
+
+def search_wb(session: cf_requests.Session, query: str, max_pages: int = 5):
     """
     Сканирует выдачу постранично. Не останавливается после первой же
     пустой/ошибочной страницы (WB иногда отдаёт временный сбой на
     отдельной странице) — сдаётся только после двух неудач подряд.
     """
     all_products = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Referer": "https://www.wildberries.ru/",
-        "Accept": "application/json",
-    }
     consecutive_failures = 0
     for page in range(1, max_pages + 1):
         url = "https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search"
@@ -69,18 +76,26 @@ def search_wb(query: str, max_pages: int = 5):
             "hide_vflags": 4294967296, "inheritFilters": "true",
             "suppressSpellcheck": "false", "ab_testing": "false",
         }
+        headers = {
+            "Accept": "application/json",
+            "Accept-Language": "ru-RU,ru;q=0.9",
+            "Origin": "https://www.wildberries.ru",
+            "Referer": f"https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        }
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            products = data.get("products") or (data.get("data") or {}).get("products") or []
-        except requests.exceptions.HTTPError as e:
-            is_rate_limited = e.response is not None and e.response.status_code == 429
-            print(f"[!] Ошибка поиска '{query}', страница {page}: {e}", file=sys.stderr)
-            if is_rate_limited:
+            resp = session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                print(f"[!] Ошибка поиска '{query}', страница {page}: 429 Too Many Requests", file=sys.stderr)
                 print("[i] Похоже на ограничение частоты запросов — пауза подольше перед следующей попыткой", file=sys.stderr)
                 time.sleep(2.5)
-            products = []
+                products = []
+            else:
+                resp.raise_for_status()
+                data = resp.json()
+                products = data.get("products") or (data.get("data") or {}).get("products") or []
         except Exception as e:
             print(f"[!] Ошибка поиска '{query}', страница {page}: {e}", file=sys.stderr)
             products = []
@@ -146,7 +161,8 @@ def main():
         tracked_products.append(p)
 
     history = load_json(HISTORY_FILE, {})
-    results = search_wb(QUERY)
+    session = make_warmed_up_session()
+    results = search_wb(session, QUERY)
 
     position_by_id = {}
     info_by_id = {}
