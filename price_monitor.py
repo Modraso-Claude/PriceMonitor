@@ -82,6 +82,52 @@ def extract_price_data(payload: dict) -> dict | None:
     }
 
 
+def read_price_from_page(page, nm_id: str) -> dict | None:
+    """
+    Запасной способ: читает цену, бренд и название прямо из разметки
+    страницы — если перехватить ответ API не удалось. Цена на странице
+    отображается покупателю, значит она есть в HTML.
+    """
+    try:
+        page.wait_for_selector(".product-page__price-block", timeout=8000)
+    except Exception:
+        pass
+
+    try:
+        data = page.evaluate("""() => {
+            const clean = (s) => (s || '').replace(/[^0-9]/g, '');
+            const priceEl =
+                document.querySelector('.price-block__wallet-price') ||
+                document.querySelector('.price-block__final-price') ||
+                document.querySelector('ins.price-block__final-price');
+            const brandEl =
+                document.querySelector('.product-page__header-brand') ||
+                document.querySelector('[class*="brand"]');
+            const nameEl =
+                document.querySelector('.product-page__title') ||
+                document.querySelector('h1');
+            return {
+                priceRaw: priceEl ? clean(priceEl.textContent) : '',
+                brand: brandEl ? brandEl.textContent.trim() : '',
+                name: nameEl ? nameEl.textContent.trim() : '',
+            };
+        }""")
+    except Exception as e:
+        print(f"[!] Не удалось прочитать страницу nm_id={nm_id}: {e}", file=sys.stderr)
+        return None
+
+    price_raw = (data or {}).get("priceRaw") or ""
+    if not price_raw.isdigit():
+        return None
+
+    return {
+        "price": int(price_raw),
+        "name": (data.get("name") or "").strip(),
+        "brand": (data.get("brand") or "").strip(),
+        "color": "",
+    }
+
+
 def fetch_prices_via_browser(nm_ids: list[str]) -> dict:
     """
     Открывает страницу каждого товара в настоящем браузере и перехватывает
@@ -112,13 +158,19 @@ def fetch_prices_via_browser(nm_ids: list[str]) -> dict:
         except Exception as e:
             print(f"[!] Не удалось открыть главную страницу: {e}", file=sys.stderr)
 
-        for nm_id in nm_ids:
+        for idx, nm_id in enumerate(nm_ids):
             captured = {}
+            seen_urls = []
 
-            def handle_response(response, _captured=captured):
+            def handle_response(response, _captured=captured, _seen=seen_urls):
                 url = response.url
-                # Ловим ответ карточки товара, как бы ни назывался путь
-                if "cards/v" in url and "detail" in url:
+                # Собираем список всех похожих на данные запросов —
+                # пригодится для диагностики, если ничего не поймаем
+                if any(k in url for k in ("card", "detail", "nm=", "product")):
+                    _seen.append(url[:160])
+                # Широкий фильтр: любой ответ, где есть и признак карточки,
+                # и наш артикул — структура путей WB периодически меняется
+                if ("detail" in url or "cards" in url) and str(nm_id) in url:
                     try:
                         _captured["payload"] = response.json()
                     except Exception:
@@ -129,7 +181,7 @@ def fetch_prices_via_browser(nm_ids: list[str]) -> dict:
             try:
                 page.goto(product_url(nm_id), timeout=45000, wait_until="domcontentloaded")
                 # Ждём, пока страница подтянет свои данные
-                for _ in range(20):
+                for _ in range(24):
                     if "payload" in captured:
                         break
                     page.wait_for_timeout(500)
@@ -140,7 +192,23 @@ def fetch_prices_via_browser(nm_ids: list[str]) -> dict:
 
             payload = captured.get("payload")
             if not payload:
+                # Запасной вариант: цена видна на самой странице —
+                # читаем её прямо из разметки
+                fallback = read_price_from_page(page, nm_id)
+                if fallback:
+                    results[nm_id] = fallback
+                    print(f"OK (со страницы) nm_id={nm_id}: {fallback['price']} ₽ ({fallback['brand']})")
+                    continue
+
                 print(f"[!] Не перехватили данные карточки для nm_id={nm_id}", file=sys.stderr)
+                # Для первого товара печатаем, что вообще пролетало —
+                # по этому списку можно подобрать правильный фильтр
+                if idx == 0:
+                    print("[i] Запросы, которые делала страница (первые 25):", file=sys.stderr)
+                    for u in seen_urls[:25]:
+                        print(f"    {u}", file=sys.stderr)
+                    if not seen_urls:
+                        print("    (ничего похожего на данные не поймано вообще)", file=sys.stderr)
                 continue
 
             data = extract_price_data(payload)
