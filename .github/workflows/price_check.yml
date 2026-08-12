@@ -1,10 +1,7 @@
 name: Мониторинг цен Wildberries
 
 on:
-  workflow_dispatch: {}   # запускается вручную кнопкой в GitHub ИЛИ внешним
-                          # планировщиком cron-job.org через GitHub API —
-                          # встроенный schedule: GitHub Actions убран, т.к.
-                          # ненадёжно пропускал запуски на бесплатном тарифе
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -23,6 +20,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Install Chromium for Playwright
+        run: python -m playwright install --with-deps chromium
 
       - name: Run price monitor
         env:
