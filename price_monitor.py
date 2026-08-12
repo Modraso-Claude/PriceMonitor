@@ -1,25 +1,24 @@
 """
-Мониторинг цен товаров на Wildberries (свои + конкуренты).
+Мониторинг цен товаров на Wildberries (свои + конкуренты) через Playwright.
 
-Логика:
-1. Читаем список товаров из products.json (nm_id — это артикул WB,
-   он же число в ссылке товара: wildberries.ru/catalog/<nm_id>/detail.aspx)
-2. Для каждого товара получаем текущую цену, бренд и цвет через
-   внутренний прокси-путь основного домена WB (www.wildberries.ru/__internal/...).
-3. Сравниваем с последней сохранённой ценой в history.json.
-4. Раз в запуск отправляем в Telegram ПОЛНЫЙ отчёт по всем товарам —
-   с текущей ценой, брендом, цветом и процентом изменения относительно
-   предыдущей проверки (даже если изменений не было).
+ПОЧЕМУ PLAYWRIGHT, А НЕ ПРОСТОЙ HTTP-ЗАПРОС:
+Мы последовательно упёрлись в несколько уровней защиты WB:
+  1. card.wb.ru / search.wb.ru — блокировка по IP дата-центров (таймауты)
+  2. www.wildberries.ru/__internal/... — 403 на обычный requests
+  3. то же самое с cookies и браузерными заголовками — снова 403
+  4. то же самое с curl_cffi (имитация TLS-отпечатка Chrome) — снова 403
+Значит, WB требует чего-то, что умеет только настоящий браузерный движок
+(скорее всего, выполнения JS-челленджа).
 
-ВАЖНО про адрес запроса: раньше здесь использовался отдельный поддомен
-card.wb.ru, но он (как и search.wb.ru) стал недоступен из GitHub Actions —
-запросы зависают на ConnectTimeout, похоже на блокировку по диапазону IP
-дата-центров. Переключились на www.wildberries.ru/__internal/u-card/... —
-это путь на основном домене сайта, найденный вручную через DevTools в
-браузере, его нельзя заблокировать, не сломав сайт для обычных посетителей.
-Если он тоже перестанет отвечать — искать новый путь тем же способом
-(DevTools → Network → Fetch/XHR → открыть страницу товара → найти запрос
-с "detail" в названии → Headers → Request URL).
+ПОДХОД: запускаем настоящий Chromium, открываем в нём обычную страницу
+товара — ровно так, как это делает покупатель. Страница сама запрашивает
+у сервера свои данные (цену, бренд, цвет), а мы просто перехватываем этот
+ответ через обработчик response. Ничего не подделываем — забираем то, что
+браузер и так легально получил.
+
+ЦЕНА ВОПРОСА: это медленнее (~3-8 сек на товар вместо 0.5), поэтому на
+24 товара уйдёт 2-4 минуты вместо 20 секунд. Для двух запусков в день
+это укладывается в бесплатные лимиты GitHub Actions с запасом.
 """
 
 import calendar
@@ -31,114 +30,131 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
-from curl_cffi import requests as cf_requests
+from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
 HISTORY_FILE = BASE_DIR / "history.json"
 
-DEST = "-1257786"
-
-# Россия не переходит на летнее время с 2014 года — фиксированный UTC+3
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-
-def make_warmed_up_session() -> cf_requests.Session:
-    """
-    Обычная библиотека requests легко отличима от настоящего браузера по
-    TLS-отпечатку (ClientHello) ещё до того, как сервер увидит какие-либо
-    заголовки — именно поэтому даже с правильными cookies/заголовками
-    запросы получали 403. curl_cffi умеет имитировать точный TLS-отпечаток
-    настоящего Chrome, оставаясь обычным HTTP-клиентом (без запуска
-    реального браузера, в отличие от Playwright/Selenium).
-    """
-    session = cf_requests.Session(impersonate="chrome124")
-    try:
-        session.get("https://www.wildberries.ru/", timeout=15)
-    except Exception as e:
-        print(f"[!] Не удалось прогреть сессию (продолжаем всё равно): {e}", file=sys.stderr)
-    return session
+REFERENCE_NM_ID = "392074718"
 
 
-def get_price(session: cf_requests.Session, nm_id: int) -> dict | None:
-    url = "https://www.wildberries.ru/__internal/u-card/cards/v4/detail"
-    params = {
-        "appType": 1,
-        "curr": "rub",
-        "dest": DEST,
-        "spp": 30,
-        "hide_vflags": 4294967296,
-        "hide_dtype": 15,
-        "mtype": 257,
-        "lang": "ru",
-        "ab_testing": "false",
-        "nm": nm_id,
-    }
-    headers = {
-        "Accept": "application/json",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Origin": "https://www.wildberries.ru",
-        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-    }
+def product_url(nm_id: str) -> str:
+    return f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
 
-    try:
-        resp = session.get(url, params=params, headers=headers, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"[!] Ошибка запроса для nm_id={nm_id}: {e}", file=sys.stderr)
-        return None
 
-    products = data.get("products") or (data.get("data") or {}).get("products")
+def extract_price_data(payload: dict) -> dict | None:
+    """Достаёт цену/бренд/цвет из JSON-ответа карточки товара."""
+    products = payload.get("products") or (payload.get("data") or {}).get("products")
     if not products:
-        print(f"[!] Товар nm_id={nm_id} не найден в ответе API", file=sys.stderr)
         return None
 
     p = products[0]
     name = p.get("name", "")
     brand = p.get("brand", "") or ""
-
     colors = p.get("colors") or []
     color = colors[0].get("name", "") if colors else ""
 
     price_kopecks = None
-    sizes = p.get("sizes") or []
-
-    for size in sizes:
-        price_block = size.get("price") or {}
-        candidate = (
-            price_block.get("product")
-            or price_block.get("total")
-            or price_block.get("basic")
-        )
+    for size in p.get("sizes") or []:
+        pb = size.get("price") or {}
+        candidate = pb.get("product") or pb.get("total") or pb.get("basic")
         if candidate:
             price_kopecks = candidate
             break
 
     if price_kopecks is None:
-        top_price = p.get("priceU") or p.get("salePriceU")
-        if top_price:
-            price_kopecks = top_price
+        price_kopecks = p.get("priceU") or p.get("salePriceU")
 
     if price_kopecks is None:
-        sizes_count = len(sizes)
-        in_stock = any((s.get("stocks") for s in sizes)) if sizes else False
-        raw_sample = json.dumps(sizes[0], ensure_ascii=False)[:300] if sizes else "нет sizes"
-        print(
-            f"[!] Не удалось извлечь цену для nm_id={nm_id} ('{name}'). "
-            f"sizes_count={sizes_count}, есть_остатки={in_stock}. "
-            f"Пример sizes[0]: {raw_sample}",
-            file=sys.stderr,
-        )
         return None
 
-    return {"price": round(price_kopecks / 100), "name": name, "brand": brand, "color": color}
+    return {
+        "price": round(price_kopecks / 100),
+        "name": name,
+        "brand": brand,
+        "color": color,
+    }
+
+
+def fetch_prices_via_browser(nm_ids: list[str]) -> dict:
+    """
+    Открывает страницу каждого товара в настоящем браузере и перехватывает
+    ответ API, который страница загружает для себя. Возвращает словарь
+    {nm_id: {price, name, brand, color}} только для успешно полученных.
+    """
+    results = {}
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            viewport={"width": 1440, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+
+        # Один раз заходим на главную — получаем cookies как обычный посетитель
+        try:
+            page.goto("https://www.wildberries.ru/", timeout=45000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+        except Exception as e:
+            print(f"[!] Не удалось открыть главную страницу: {e}", file=sys.stderr)
+
+        for nm_id in nm_ids:
+            captured = {}
+
+            def handle_response(response, _captured=captured):
+                url = response.url
+                # Ловим ответ карточки товара, как бы ни назывался путь
+                if "cards/v" in url and "detail" in url:
+                    try:
+                        _captured["payload"] = response.json()
+                    except Exception:
+                        pass
+
+            page.on("response", handle_response)
+
+            try:
+                page.goto(product_url(nm_id), timeout=45000, wait_until="domcontentloaded")
+                # Ждём, пока страница подтянет свои данные
+                for _ in range(20):
+                    if "payload" in captured:
+                        break
+                    page.wait_for_timeout(500)
+            except Exception as e:
+                print(f"[!] Ошибка загрузки страницы nm_id={nm_id}: {e}", file=sys.stderr)
+
+            page.remove_listener("response", handle_response)
+
+            payload = captured.get("payload")
+            if not payload:
+                print(f"[!] Не перехватили данные карточки для nm_id={nm_id}", file=sys.stderr)
+                continue
+
+            data = extract_price_data(payload)
+            if data is None:
+                print(f"[!] Не удалось извлечь цену из ответа для nm_id={nm_id}", file=sys.stderr)
+                continue
+
+            results[nm_id] = data
+            print(f"OK nm_id={nm_id}: {data['price']} ₽ ({data['brand']})")
+
+        context.close()
+        browser.close()
+
+    return results
 
 
 def load_json(path: Path, default):
@@ -155,8 +171,7 @@ def save_json(path: Path, data):
 
 def send_telegram_blocks(header: str, blocks: list[str]):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы — "
-              "уведомление не отправлено.", file=sys.stderr)
+        print("[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы.", file=sys.stderr)
         return
 
     limit = 3500
@@ -181,22 +196,11 @@ def send_telegram_blocks(header: str, blocks: list[str]):
             )
             data = resp.json()
             if not data.get("ok"):
-                print(
-                    f"[!] Telegram API вернул ошибку: {data.get('description')} "
-                    f"(код {data.get('error_code')})",
-                    file=sys.stderr,
-                )
+                print(f"[!] Telegram API вернул ошибку: {data.get('description')}", file=sys.stderr)
             else:
                 print("Сообщение успешно отправлено в Telegram.")
         except Exception as e:
             print(f"[!] Не удалось отправить сообщение в Telegram: {e}", file=sys.stderr)
-
-
-REFERENCE_NM_ID = "392074718"
-
-
-def product_url(nm_id: str) -> str:
-    return f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
 
 
 def parse_history_date(date_str: str) -> datetime | None:
@@ -243,9 +247,7 @@ def send_median_report(history: dict, title: str, start_dt: datetime, end_dt: da
         return
 
     rows.sort(key=lambda r: r["median"], reverse=True)
-    blocks = [r["text"] for r in rows]
-    header = f"📊 <b>{title}</b>"
-    send_telegram_blocks(header, blocks)
+    send_telegram_blocks(f"📊 <b>{title}</b>", [r["text"] for r in rows])
 
 
 def main():
@@ -255,17 +257,30 @@ def main():
     now = datetime.now(MOSCOW_TZ)
     timestamp = now.strftime("%d.%m.%Y %H:%M МСК")
 
-    session = make_warmed_up_session()
+    # Убираем дубли артикулов, сохраняя порядок
+    seen = set()
+    unique_products = []
+    for p in products:
+        nid = str(p.get("nm_id"))
+        if nid in seen:
+            continue
+        seen.add(nid)
+        unique_products.append(p)
+
+    nm_ids = [str(p["nm_id"]) for p in unique_products]
+    print(f"Запускаю браузер для {len(nm_ids)} товаров...")
+    fetched = fetch_prices_via_browser(nm_ids)
+    print(f"Успешно получено: {len(fetched)} из {len(nm_ids)}")
 
     items = []
     error_lines = []
 
-    for product in products:
+    for product in unique_products:
         nm_id = str(product["nm_id"])
         label = product.get("name") or nm_id
         ptype = product.get("type", "own")
 
-        result = get_price(session, product["nm_id"])
+        result = fetched.get(nm_id)
         if result is None:
             error_lines.append(f"⚠️ <b>{label}</b> (артикул {nm_id}) — не удалось получить цену")
             continue
@@ -286,22 +301,13 @@ def main():
         points.append({"date": timestamp, "price": price})
 
         items.append({
-            "nm_id": nm_id,
-            "price": price,
-            "last_price": last_price,
-            "wb_name": wb_name,
-            "brand": brand,
-            "color": color,
-            "ptype": ptype,
+            "nm_id": nm_id, "price": price, "last_price": last_price,
+            "wb_name": wb_name, "brand": brand, "color": color, "ptype": ptype,
         })
-
-        if last_price is not None and last_price != price:
-            print(f"Изменение цены: {wb_name}: {last_price} -> {price}")
 
     reference_price = next(
         (it["price"] for it in items if it["nm_id"] == REFERENCE_NM_ID), None
     )
-
     items.sort(key=lambda it: it["price"], reverse=True)
 
     report_lines = []
@@ -337,8 +343,7 @@ def main():
 
     report_lines.extend(error_lines)
 
-    header = f"💰 <b>Отчёт по ценам Wildberries</b> ({timestamp})"
-    send_telegram_blocks(header, report_lines)
+    send_telegram_blocks(f"💰 <b>Отчёт по ценам Wildberries</b> ({timestamp})", report_lines)
     print("Отчёт отправлен.")
 
     meta = history.setdefault("_meta", {})
@@ -351,8 +356,7 @@ def main():
         send_median_report(
             history,
             f"Медианная цена за неделю ({week_start.strftime('%d.%m')}–{now.strftime('%d.%m.%Y')})",
-            week_start,
-            now,
+            week_start, now,
         )
         meta["last_weekly_report"] = week_id
         print("Недельный отчёт с медианой отправлен.")
@@ -364,8 +368,7 @@ def main():
         send_median_report(
             history,
             f"Медианная цена за месяц ({month_start.strftime('%m.%Y')})",
-            month_start,
-            now,
+            month_start, now,
         )
         meta["last_monthly_report"] = month_id
         print("Месячный отчёт с медианой отправлен.")
