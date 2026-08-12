@@ -209,6 +209,16 @@ def fetch_prices_via_browser(nm_ids: list[str]) -> dict:
                         print(f"    {u}", file=sys.stderr)
                     if not seen_urls:
                         print("    (ничего похожего на данные не поймано вообще)", file=sys.stderr)
+                    # Что реально показал браузер вместо страницы товара
+                    try:
+                        print(f"[i] Итоговый URL: {page.url}", file=sys.stderr)
+                        print(f"[i] Заголовок страницы: {page.title()}", file=sys.stderr)
+                        body_text = page.evaluate(
+                            "() => (document.body ? document.body.innerText : '').slice(0, 600)"
+                        )
+                        print(f"[i] Текст страницы (начало):\n{body_text}", file=sys.stderr)
+                    except Exception as diag_err:
+                        print(f"[i] Не удалось снять диагностику страницы: {diag_err}", file=sys.stderr)
                 continue
 
             data = extract_price_data(payload)
