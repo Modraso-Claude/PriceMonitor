@@ -2,38 +2,36 @@
 Проверяет позиции отслеживаемых товаров в поисковой выдаче Wildberries
 по ОДНОМУ поисковому запросу и отправляет результат в Telegram.
 
-Запускается НЕ по расписанию, а по требованию: бот на PythonAnywhere
-дёргает GitHub Actions через API (workflow_dispatch) при нажатии кнопки
-в Telegram, передавая нужный запрос как input.
-
-ВАЖНО про адрес запроса: раньше здесь использовался отдельный поддомен
-search.wb.ru, но он стал недоступен из GitHub Actions (та же история,
-что и с card.wb.ru в price_monitor.py — запросы зависают на
-ConnectTimeout). Переключились на www.wildberries.ru/__internal/u-search/...
-— путь на основном домене сайта, найденный вручную через DevTools.
+Работает через Playwright по той же причине, что и price_monitor.py:
+обычные HTTP-запросы (в т.ч. с cookies, браузерными заголовками и
+имитацией TLS-отпечатка через curl_cffi) получают от WB 403. Настоящий
+браузер открывает страницу поиска как обычный посетитель, а мы
+перехватываем ответы API, которые страница загружает сама.
 
 Переменные окружения:
-  SEARCH_QUERY        — какой запрос проверять (передаётся из workflow input)
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — те же секреты, что у price_monitor.py
+  SEARCH_QUERY        — какой запрос проверять (из workflow input)
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
 import json
 import os
 import sys
-import time
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
-from curl_cffi import requests as cf_requests
+from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
 HISTORY_FILE = BASE_DIR / "history.json"
 
-DEST = "-1257786"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 QUERY = os.environ.get("SEARCH_QUERY", "").strip()
+
+# Сколько страниц выдачи просматривать (на странице обычно ~100 товаров)
+MAX_PAGES = 4
 
 
 def product_url(nm_id: str) -> str:
@@ -47,70 +45,85 @@ def load_json(path: Path, default):
     return default
 
 
-
-def make_warmed_up_session() -> cf_requests.Session:
-    """См. price_monitor.py — обычная requests легко отличима от Chrome
-    по TLS-отпечатку, поэтому используем curl_cffi для его имитации."""
-    session = cf_requests.Session(impersonate="chrome124")
-    try:
-        session.get("https://www.wildberries.ru/", timeout=15)
-    except Exception as e:
-        print(f"[!] Не удалось прогреть сессию (продолжаем всё равно): {e}", file=sys.stderr)
-    return session
-
-
-def search_wb(session: cf_requests.Session, query: str, max_pages: int = 5):
+def search_via_browser(query: str) -> list:
     """
-    Сканирует выдачу постранично. Не останавливается после первой же
-    пустой/ошибочной страницы (WB иногда отдаёт временный сбой на
-    отдельной странице) — сдаётся только после двух неудач подряд.
+    Открывает страницы поиска в настоящем браузере и собирает товары в
+    порядке их показа, перехватывая ответы поискового API.
     """
     all_products = []
-    consecutive_failures = 0
-    for page in range(1, max_pages + 1):
-        url = "https://www.wildberries.ru/__internal/u-search/exactmatch/ru/common/v18/search"
-        params = {
-            "appType": 1, "curr": "rub", "dest": DEST, "lang": "ru",
-            "locale": "ru", "page": page, "query": query, "resultset": "catalog",
-            "sort": "popular", "spp": 30, "hide_dtype": 15,
-            "hide_vflags": 4294967296, "inheritFilters": "true",
-            "suppressSpellcheck": "false", "ab_testing": "false",
-        }
-        headers = {
-            "Accept": "application/json",
-            "Accept-Language": "ru-RU,ru;q=0.9",
-            "Origin": "https://www.wildberries.ru",
-            "Referer": f"https://www.wildberries.ru/catalog/0/search.aspx?search={query}",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
-        }
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            viewport={"width": 1440, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+
         try:
-            resp = session.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code == 429:
-                print(f"[!] Ошибка поиска '{query}', страница {page}: 429 Too Many Requests", file=sys.stderr)
-                print("[i] Похоже на ограничение частоты запросов — пауза подольше перед следующей попыткой", file=sys.stderr)
-                time.sleep(2.5)
-                products = []
-            else:
-                resp.raise_for_status()
-                data = resp.json()
-                products = data.get("products") or (data.get("data") or {}).get("products") or []
+            page.goto("https://www.wildberries.ru/", timeout=45000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
         except Exception as e:
-            print(f"[!] Ошибка поиска '{query}', страница {page}: {e}", file=sys.stderr)
-            products = []
+            print(f"[!] Не удалось открыть главную страницу: {e}", file=sys.stderr)
 
-        if not products:
-            consecutive_failures += 1
-            print(f"[i] Страница {page} пустая (подряд неудач: {consecutive_failures})", file=sys.stderr)
-            if consecutive_failures >= 2:
+        for page_num in range(1, MAX_PAGES + 1):
+            captured = []
+
+            def handle_response(response, _captured=captured):
+                url = response.url
+                if "search" in url and ("exactmatch" in url or "catalog" in url):
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        return
+                    products = (
+                        payload.get("products")
+                        or (payload.get("data") or {}).get("products")
+                        or []
+                    )
+                    if products:
+                        _captured.append(products)
+
+            page.on("response", handle_response)
+
+            search_url = (
+                f"https://www.wildberries.ru/catalog/0/search.aspx"
+                f"?search={quote(query)}&page={page_num}&sort=popular"
+            )
+            try:
+                page.goto(search_url, timeout=45000, wait_until="domcontentloaded")
+                for _ in range(24):
+                    if captured:
+                        break
+                    page.wait_for_timeout(500)
+                # Немного прокручиваем — WB догружает часть карточек лениво
+                page.mouse.wheel(0, 4000)
+                page.wait_for_timeout(1500)
+            except Exception as e:
+                print(f"[!] Ошибка загрузки страницы поиска {page_num}: {e}", file=sys.stderr)
+
+            page.remove_listener("response", handle_response)
+
+            if not captured:
+                print(f"[i] Страница {page_num}: ничего не перехвачено, останавливаюсь", file=sys.stderr)
                 break
-            time.sleep(0.7)
-            continue
 
-        consecutive_failures = 0
-        all_products.extend(products)
-        time.sleep(0.3)
+            page_products = []
+            for chunk in captured:
+                page_products.extend(chunk)
+            print(f"Страница {page_num}: получено {len(page_products)} товаров")
+            all_products.extend(page_products)
+
+        context.close()
+        browser.close()
+
     return all_products
 
 
@@ -150,10 +163,10 @@ def main():
         print("[!] SEARCH_QUERY не задан — нечего проверять", file=sys.stderr)
         return
 
-    tracked_products_raw = load_json(PRODUCTS_FILE, [])
+    tracked_raw = load_json(PRODUCTS_FILE, [])
     seen_ids = set()
     tracked_products = []
-    for p in tracked_products_raw:
+    for p in tracked_raw:
         nid = str(p.get("nm_id"))
         if nid in seen_ids:
             continue
@@ -161,8 +174,10 @@ def main():
         tracked_products.append(p)
 
     history = load_json(HISTORY_FILE, {})
-    session = make_warmed_up_session()
-    results = search_wb(session, QUERY)
+
+    print(f"Ищу «{QUERY}» через браузер...")
+    results = search_via_browser(QUERY)
+    print(f"Всего собрано {len(results)} позиций выдачи")
 
     position_by_id = {}
     info_by_id = {}
@@ -180,7 +195,6 @@ def main():
         item = info_by_id.get(nm_id)
 
         if item:
-            # Товар нашёлся в этой выдаче — берём свежие данные прямо из неё
             brand = item.get("brand", "") or label
             colors = item.get("colors") or []
             color = colors[0].get("name", "") if colors else "н/д"
@@ -192,10 +206,6 @@ def main():
                     break
             price_str = f"{round(price_kopecks / 100)} ₽" if price_kopecks else "н/д"
         else:
-            # Товар не найден в просканированной части выдачи — этот конкретный
-            # запрос ничего о нём не знает. Подставляем последние известные
-            # данные из history.json (их накапливает price_monitor.py дважды
-            # в день), а не пустое "н/д".
             hist_entry = history.get(nm_id, {})
             brand = hist_entry.get("brand") or label
             color = hist_entry.get("color") or "н/д"
