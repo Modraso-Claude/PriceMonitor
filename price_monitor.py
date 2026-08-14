@@ -1,24 +1,27 @@
 """
-Мониторинг цен товаров на Wildberries (свои + конкуренты) через Playwright.
+Мониторинг цен товаров на Wildberries (свои + конкуренты).
 
-ПОЧЕМУ PLAYWRIGHT, А НЕ ПРОСТОЙ HTTP-ЗАПРОС:
-Мы последовательно упёрлись в несколько уровней защиты WB:
-  1. card.wb.ru / search.wb.ru — блокировка по IP дата-центров (таймауты)
-  2. www.wildberries.ru/__internal/... — 403 на обычный requests
-  3. то же самое с cookies и браузерными заголовками — снова 403
-  4. то же самое с curl_cffi (имитация TLS-отпечатка Chrome) — снова 403
-Значит, WB требует чего-то, что умеет только настоящий браузерный движок
-(скорее всего, выполнения JS-челленджа).
+Логика:
+1. Читаем список товаров из products.json (nm_id — это артикул WB,
+   он же число в ссылке товара: wildberries.ru/catalog/<nm_id>/detail.aspx)
+2. Для каждого товара получаем текущую цену, бренд и цвет.
+3. Сравниваем с последней сохранённой ценой в history.json.
+4. Отправляем в Telegram отчёт по всем товарам — с ценой, брендом,
+   цветом и процентом изменения относительно предыдущей проверки.
+5. По воскресеньям и в последний день месяца дополнительно шлём
+   отчёт с медианной ценой за период.
 
-ПОДХОД: запускаем настоящий Chromium, открываем в нём обычную страницу
-товара — ровно так, как это делает покупатель. Страница сама запрашивает
-у сервера свои данные (цену, бренд, цвет), а мы просто перехватываем этот
-ответ через обработчик response. Ничего не подделываем — забираем то, что
-браузер и так легально получил.
+ВАЖНО ПРО ДОСТУП К ДАННЫМ:
+Wildberries активно ограничивает автоматический доступ к своим данным.
+На момент последней правки запросы с серверов GitHub Actions получают
+капчу («Подозрительная активность»), потому что WB блокирует диапазоны
+IP-адресов дата-центров. Это не чинится изменением кода — нужен доступ
+с "жилого" IP. Скрипт оставлен в рабочем виде на случай, если доступ
+восстановится: тогда всё заработает без правок.
 
-ЦЕНА ВОПРОСА: это медленнее (~3-8 сек на товар вместо 0.5), поэтому на
-24 товара уйдёт 2-4 минуты вместо 20 секунд. Для двух запусков в день
-это укладывается в бесплатные лимиты GitHub Actions с запасом.
+Адреса запросов брались вручную через DevTools браузера
+(Network → Fetch/XHR → открыть страницу товара → запрос с "detail").
+Если формат снова поменяется — искать новый адрес тем же способом.
 """
 
 import calendar
@@ -30,12 +33,12 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
-from playwright.sync_api import sync_playwright
 
 BASE_DIR = Path(__file__).parent
 PRODUCTS_FILE = BASE_DIR / "products.json"
 HISTORY_FILE = BASE_DIR / "history.json"
 
+DEST = "-1257786"
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -48,10 +51,38 @@ def product_url(nm_id: str) -> str:
     return f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
 
 
-def extract_price_data(payload: dict) -> dict | None:
-    """Достаёт цену/бренд/цвет из JSON-ответа карточки товара."""
-    products = payload.get("products") or (payload.get("data") or {}).get("products")
+def get_price(nm_id: int) -> dict | None:
+    url = "https://www.wildberries.ru/__internal/u-card/cards/v4/detail"
+    params = {
+        "appType": 1,
+        "curr": "rub",
+        "dest": DEST,
+        "spp": 30,
+        "hide_vflags": 4294967296,
+        "hide_dtype": 15,
+        "mtype": 257,
+        "lang": "ru",
+        "ab_testing": "false",
+        "nm": nm_id,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Referer": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+        "Accept": "application/json",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[!] Ошибка запроса для nm_id={nm_id}: {e}", file=sys.stderr)
+        return None
+
+    products = data.get("products") or (data.get("data") or {}).get("products")
     if not products:
+        print(f"[!] Товар nm_id={nm_id} не найден в ответе API", file=sys.stderr)
         return None
 
     p = products[0]
@@ -61,7 +92,8 @@ def extract_price_data(payload: dict) -> dict | None:
     color = colors[0].get("name", "") if colors else ""
 
     price_kopecks = None
-    for size in p.get("sizes") or []:
+    sizes = p.get("sizes") or []
+    for size in sizes:
         pb = size.get("price") or {}
         candidate = pb.get("product") or pb.get("total") or pb.get("basic")
         if candidate:
@@ -72,167 +104,18 @@ def extract_price_data(payload: dict) -> dict | None:
         price_kopecks = p.get("priceU") or p.get("salePriceU")
 
     if price_kopecks is None:
-        return None
-
-    return {
-        "price": round(price_kopecks / 100),
-        "name": name,
-        "brand": brand,
-        "color": color,
-    }
-
-
-def read_price_from_page(page, nm_id: str) -> dict | None:
-    """
-    Запасной способ: читает цену, бренд и название прямо из разметки
-    страницы — если перехватить ответ API не удалось. Цена на странице
-    отображается покупателю, значит она есть в HTML.
-    """
-    try:
-        page.wait_for_selector(".product-page__price-block", timeout=8000)
-    except Exception:
-        pass
-
-    try:
-        data = page.evaluate("""() => {
-            const clean = (s) => (s || '').replace(/[^0-9]/g, '');
-            const priceEl =
-                document.querySelector('.price-block__wallet-price') ||
-                document.querySelector('.price-block__final-price') ||
-                document.querySelector('ins.price-block__final-price');
-            const brandEl =
-                document.querySelector('.product-page__header-brand') ||
-                document.querySelector('[class*="brand"]');
-            const nameEl =
-                document.querySelector('.product-page__title') ||
-                document.querySelector('h1');
-            return {
-                priceRaw: priceEl ? clean(priceEl.textContent) : '',
-                brand: brandEl ? brandEl.textContent.trim() : '',
-                name: nameEl ? nameEl.textContent.trim() : '',
-            };
-        }""")
-    except Exception as e:
-        print(f"[!] Не удалось прочитать страницу nm_id={nm_id}: {e}", file=sys.stderr)
-        return None
-
-    price_raw = (data or {}).get("priceRaw") or ""
-    if not price_raw.isdigit():
-        return None
-
-    return {
-        "price": int(price_raw),
-        "name": (data.get("name") or "").strip(),
-        "brand": (data.get("brand") or "").strip(),
-        "color": "",
-    }
-
-
-def fetch_prices_via_browser(nm_ids: list[str]) -> dict:
-    """
-    Открывает страницу каждого товара в настоящем браузере и перехватывает
-    ответ API, который страница загружает для себя. Возвращает словарь
-    {nm_id: {price, name, brand, color}} только для успешно полученных.
-    """
-    results = {}
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            args=["--disable-blink-features=AutomationControlled"]
+        sizes_count = len(sizes)
+        in_stock = any((s.get("stocks") for s in sizes)) if sizes else False
+        raw_sample = json.dumps(sizes[0], ensure_ascii=False)[:300] if sizes else "нет sizes"
+        print(
+            f"[!] Не удалось извлечь цену для nm_id={nm_id} ('{name}'). "
+            f"sizes_count={sizes_count}, есть_остатки={in_stock}. "
+            f"Пример sizes[0]: {raw_sample}",
+            file=sys.stderr,
         )
-        context = browser.new_context(
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            viewport={"width": 1440, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
+        return None
 
-        # Один раз заходим на главную — получаем cookies как обычный посетитель
-        try:
-            page.goto("https://www.wildberries.ru/", timeout=45000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
-        except Exception as e:
-            print(f"[!] Не удалось открыть главную страницу: {e}", file=sys.stderr)
-
-        for idx, nm_id in enumerate(nm_ids):
-            captured = {}
-            seen_urls = []
-
-            def handle_response(response, _captured=captured, _seen=seen_urls):
-                url = response.url
-                # Собираем список всех похожих на данные запросов —
-                # пригодится для диагностики, если ничего не поймаем
-                if any(k in url for k in ("card", "detail", "nm=", "product")):
-                    _seen.append(url[:160])
-                # Широкий фильтр: любой ответ, где есть и признак карточки,
-                # и наш артикул — структура путей WB периодически меняется
-                if ("detail" in url or "cards" in url) and str(nm_id) in url:
-                    try:
-                        _captured["payload"] = response.json()
-                    except Exception:
-                        pass
-
-            page.on("response", handle_response)
-
-            try:
-                page.goto(product_url(nm_id), timeout=45000, wait_until="domcontentloaded")
-                # Ждём, пока страница подтянет свои данные
-                for _ in range(24):
-                    if "payload" in captured:
-                        break
-                    page.wait_for_timeout(500)
-            except Exception as e:
-                print(f"[!] Ошибка загрузки страницы nm_id={nm_id}: {e}", file=sys.stderr)
-
-            page.remove_listener("response", handle_response)
-
-            payload = captured.get("payload")
-            if not payload:
-                # Запасной вариант: цена видна на самой странице —
-                # читаем её прямо из разметки
-                fallback = read_price_from_page(page, nm_id)
-                if fallback:
-                    results[nm_id] = fallback
-                    print(f"OK (со страницы) nm_id={nm_id}: {fallback['price']} ₽ ({fallback['brand']})")
-                    continue
-
-                print(f"[!] Не перехватили данные карточки для nm_id={nm_id}", file=sys.stderr)
-                # Для первого товара печатаем, что вообще пролетало —
-                # по этому списку можно подобрать правильный фильтр
-                if idx == 0:
-                    print("[i] Запросы, которые делала страница (первые 25):", file=sys.stderr)
-                    for u in seen_urls[:25]:
-                        print(f"    {u}", file=sys.stderr)
-                    if not seen_urls:
-                        print("    (ничего похожего на данные не поймано вообще)", file=sys.stderr)
-                    # Что реально показал браузер вместо страницы товара
-                    try:
-                        print(f"[i] Итоговый URL: {page.url}", file=sys.stderr)
-                        print(f"[i] Заголовок страницы: {page.title()}", file=sys.stderr)
-                        body_text = page.evaluate(
-                            "() => (document.body ? document.body.innerText : '').slice(0, 600)"
-                        )
-                        print(f"[i] Текст страницы (начало):\n{body_text}", file=sys.stderr)
-                    except Exception as diag_err:
-                        print(f"[i] Не удалось снять диагностику страницы: {diag_err}", file=sys.stderr)
-                continue
-
-            data = extract_price_data(payload)
-            if data is None:
-                print(f"[!] Не удалось извлечь цену из ответа для nm_id={nm_id}", file=sys.stderr)
-                continue
-
-            results[nm_id] = data
-            print(f"OK nm_id={nm_id}: {data['price']} ₽ ({data['brand']})")
-
-        context.close()
-        browser.close()
-
-    return results
+    return {"price": round(price_kopecks / 100), "name": name, "brand": brand, "color": color}
 
 
 def load_json(path: Path, default):
@@ -345,11 +228,6 @@ def main():
         seen.add(nid)
         unique_products.append(p)
 
-    nm_ids = [str(p["nm_id"]) for p in unique_products]
-    print(f"Запускаю браузер для {len(nm_ids)} товаров...")
-    fetched = fetch_prices_via_browser(nm_ids)
-    print(f"Успешно получено: {len(fetched)} из {len(nm_ids)}")
-
     items = []
     error_lines = []
 
@@ -358,7 +236,7 @@ def main():
         label = product.get("name") or nm_id
         ptype = product.get("type", "own")
 
-        result = fetched.get(nm_id)
+        result = get_price(product["nm_id"])
         if result is None:
             error_lines.append(f"⚠️ <b>{label}</b> (артикул {nm_id}) — не удалось получить цену")
             continue
@@ -382,6 +260,9 @@ def main():
             "nm_id": nm_id, "price": price, "last_price": last_price,
             "wb_name": wb_name, "brand": brand, "color": color, "ptype": ptype,
         })
+
+        if last_price is not None and last_price != price:
+            print(f"Изменение цены: {wb_name}: {last_price} -> {price}")
 
     reference_price = next(
         (it["price"] for it in items if it["nm_id"] == REFERENCE_NM_ID), None
